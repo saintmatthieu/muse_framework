@@ -185,6 +185,7 @@ enum class AudioResourceType {
     Lv2Plugin,
     AudioUnit,
     NyquistPlugin,
+    ClapPlugin,
 };
 
 static const std::map<AudioResourceType, QString> RESOURCE_TYPE_MAP = {
@@ -196,6 +197,7 @@ static const std::map<AudioResourceType, QString> RESOURCE_TYPE_MAP = {
     { AudioResourceType::Lv2Plugin, "lv2_plugin" },
     { AudioResourceType::AudioUnit, "audio_unit" },
     { AudioResourceType::NyquistPlugin, "nyquist_plugin" },
+    { AudioResourceType::ClapPlugin, "clap_plugin" },
 };
 
 struct AudioResourceMeta {
@@ -312,6 +314,7 @@ struct AudioFxParams {
         case AudioResourceType::FluidSoundfont:
         case AudioResourceType::MuseSamplerSoundPack:
         case AudioResourceType::NyquistPlugin:
+        case AudioResourceType::ClapPlugin:
         case AudioResourceType::Undefined: break;
         }
 
@@ -393,6 +396,7 @@ inline AudioSourceType sourceTypeFromResourceType(AudioResourceType type)
     case AudioResourceType::Lv2Plugin:
     case AudioResourceType::NativeEffect:
     case AudioResourceType::NyquistPlugin:
+    case AudioResourceType::ClapPlugin:
     case AudioResourceType::Undefined: break;
     }
 

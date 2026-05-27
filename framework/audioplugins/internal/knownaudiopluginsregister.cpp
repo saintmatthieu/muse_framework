@@ -40,6 +40,7 @@ static const std::map<audio::AudioResourceType, std::string> RESOURCE_TYPE_TO_ST
     { audio::AudioResourceType::AudioUnit, "AudioUnit" },
     { audio::AudioResourceType::NyquistPlugin, "NyquistPlugin" },
     { audio::AudioResourceType::NativeEffect, "NativeEffect" },
+    { audio::AudioResourceType::ClapPlugin, "ClapPlugin" },
 };
 
 static JsonObject attributesToJson(const AudioResourceAttributes& attributes)
