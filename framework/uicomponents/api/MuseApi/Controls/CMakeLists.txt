@@ -49,6 +49,7 @@ set(UICOMPONENTS_FILES
     ${UICOMPONENTS_QML_DIR}/InfoPanel.qml
     ${UICOMPONENTS_QML_DIR}/ListItemBlank.qml
     ${UICOMPONENTS_QML_DIR}/MenuButton.qml
+    ${UICOMPONENTS_QML_DIR}/NavigationFocusBorder.qml
     ${UICOMPONENTS_QML_DIR}/NumberInputField.qml
     ${UICOMPONENTS_QML_DIR}/PageIndicator.qml
     ${UICOMPONENTS_QML_DIR}/PageTabButton.qml
