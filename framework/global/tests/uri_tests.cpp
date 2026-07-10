@@ -130,3 +130,47 @@ TEST_F(Global_UriTests, UriQuery_ToString)
     std::string str2 = q.toString();
     EXPECT_EQ(str2, "muse://some/path?param1=value1&param2=value2");
 }
+
+TEST_F(Global_UriTests, UriQuery_ToString_PercentEncodesSpecialChars)
+{
+    //! GIVEN A param value containing characters that are meaningful to the
+    //! query syntax itself ('/', '&', '=')
+
+    UriQuery q("muse://some/path");
+    q.addParam("effectId", Val("Steinberg/Compressor&Limiter=1"));
+
+    //! DO to string
+    std::string str = q.toString();
+
+    //! THEN the value is percent-encoded so it can't be misparsed as extra params
+    EXPECT_EQ(str, "muse://some/path?effectId=Steinberg%2FCompressor%26Limiter%3D1");
+
+    //! AND parsing it back recovers the original, raw value
+    UriQuery q2(str);
+    EXPECT_EQ(q2.param("effectId"), Val("Steinberg/Compressor&Limiter=1"));
+}
+
+TEST_F(Global_UriTests, UriQuery_ToString_RoundTrip_PercentAndQuote)
+{
+    //! GIVEN A param value containing a literal '%' and a single quote
+
+    UriQuery q("muse://some/path");
+    q.addParam("value", Val("100% it's ok"));
+
+    //! DO round-trip through toString and re-parse
+    UriQuery q2(q.toString());
+
+    //! THEN the original value survives untouched
+    EXPECT_EQ(q2.param("value"), Val("100% it's ok"));
+}
+
+TEST_F(Global_UriTests, UriQuery_Parse_LiteralPercentIsLeftAlone)
+{
+    //! GIVEN A hand-written uri whose value contains a '%' not followed by
+    //! two hex digits (i.e. not a valid percent-encoding escape)
+
+    UriQuery q("muse://some/path?discount=50% off");
+
+    //! THEN it is left untouched rather than being treated as an escape
+    EXPECT_EQ(q.param("discount"), Val("50% off"));
+}

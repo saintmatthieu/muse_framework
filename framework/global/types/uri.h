@@ -63,6 +63,12 @@ public:
     io::path_t toLocalFile() const;
     static Uri fromLocalFile(const io::path_t& path);
 
+    //! NOTE https://url.spec.whatwg.org/#percent-encode
+    //! extraSafeChars are additional characters left unescaped (e.g. '/' for file paths)
+    static std::string percentEncode(const std::string& str, const std::string& extraSafeChars = std::string());
+    //! NOTE https://url.spec.whatwg.org/#percent-decode
+    static std::string percentDecode(const std::string& str);
+
 private:
 
     Scheme m_scheme;
