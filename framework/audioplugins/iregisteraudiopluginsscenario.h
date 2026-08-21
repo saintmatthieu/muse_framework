@@ -49,6 +49,12 @@ public:
 
     // validate=false only persists Discovered placeholders, to be validated on the next scan
     virtual Ret registerNewPlugins(const io::paths_t& pluginPaths, bool validate = true) = 0;
+
+    // Returns as soon as Discovered placeholders are persisted; validation
+    // continues in the background and results are flushed to the registry
+    // (with pluginInfoListChanged notifications) as they arrive. If a
+    // background validation is already running, the paths join its queue.
+    virtual Ret registerNewPluginsAsync(const io::paths_t& pluginPaths) = 0;
     virtual Ret unregisterRemovedPlugins(const PluginResourceIdList& pluginIds) = 0;
 
     virtual Ret registerPlugin(const io::path_t& pluginPath) = 0;
