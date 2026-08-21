@@ -27,12 +27,14 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
 
+#include "global/async/async.h"
 #include "global/containers.h"
 #include "global/translation.h"
 
@@ -77,6 +79,26 @@ void processProgressEvents()
 constexpr int AUDIO_PLUGIN_REGISTRATION_TIMEOUT_MS = 15000;
 }
 
+// Shared TODO list for background validation: worker threads pop one path at
+// a time, so a plugin that takes seconds to validate never holds back the
+// rest of the queue. Results are marshalled to the main thread one by one.
+struct RegisterAudioPluginsScenario::AsyncScan {
+    std::thread::id mainThreadId;
+    std::string appPath;
+
+    std::mutex todoMutex;
+    std::deque<io::path_t> todo;
+
+    std::atomic<int64_t> dispatchedCount { 0 };
+    std::atomic<int64_t> activeWorkers { 0 };
+    std::atomic<int64_t> resultFileSeq { 0 };
+
+    // main thread only
+    std::vector<std::thread> workers;
+    int64_t queuedCount = 0;
+    int64_t doneCount = 0;
+};
+
 void RegisterAudioPluginsScenario::init()
 {
     TRACEFUNC;
@@ -89,6 +111,25 @@ void RegisterAudioPluginsScenario::init()
     Ret ret = knownPluginsRegister()->load();
     if (!ret) {
         LOGE() << ret.toString();
+    }
+}
+
+void RegisterAudioPluginsScenario::deinit()
+{
+    m_shuttingDown = true;
+    m_aborted = true;
+
+    if (m_asyncScan) {
+        SCAN_TRACE() << "Shutting down background plugin validation: doneCount=" << m_asyncScan->doneCount
+                     << ", queuedCount=" << m_asyncScan->queuedCount;
+        // remaining paths keep their Discovered placeholders and are
+        // re-validated on the next launch
+        for (std::thread& workerThread : m_asyncScan->workers) {
+            if (workerThread.joinable()) {
+                workerThread.join();
+            }
+        }
+        m_asyncScan.reset();
     }
 }
 
@@ -253,6 +294,193 @@ Ret RegisterAudioPluginsScenario::registerNewPlugins(const io::paths_t& pluginPa
     }
 
     return knownPluginsRegister()->load();
+}
+
+Ret RegisterAudioPluginsScenario::registerNewPluginsAsync(const io::paths_t& pluginPaths)
+{
+    TRACEFUNC;
+
+    if (pluginPaths.empty()) {
+        return make_ok();
+    }
+
+    Ret ret = persistDiscoveredPlaceholders(pluginPaths);
+    if (!ret) {
+        return ret;
+    }
+
+    // registerPlugins() doesn't notify by itself; make the Discovered
+    // placeholders visible (e.g. in the plugin manager) right away
+    knownPluginsRegister()->pluginInfoListChanged().notify();
+
+    if (!m_asyncScan) {
+        m_asyncScan = std::make_shared<AsyncScan>();
+        m_asyncScan->mainThreadId = std::this_thread::get_id();
+        m_asyncScan->appPath = globalConfiguration()->appBinPath().toStdString();
+    }
+
+    int64_t added = 0;
+    int64_t todoSize = 0;
+    {
+        // scanners may report the same path more than once; a TODO item must
+        // not be validated twice
+        std::lock_guard lock(m_asyncScan->todoMutex);
+        for (const io::path_t& path : pluginPaths) {
+            if (std::find(m_asyncScan->todo.cbegin(), m_asyncScan->todo.cend(), path) == m_asyncScan->todo.cend()) {
+                m_asyncScan->todo.push_back(path);
+                ++added;
+            }
+        }
+        todoSize = static_cast<int64_t>(m_asyncScan->todo.size());
+    }
+    m_asyncScan->queuedCount += added;
+
+    SCAN_TRACE() << "Queued plugin paths for background validation: added=" << added
+                 << ", queuedCount=" << m_asyncScan->queuedCount
+                 << ", doneCount=" << m_asyncScan->doneCount;
+
+    const int64_t targetWorkers = std::min(pluginScanConcurrency(), todoSize);
+    startAsyncWorkers(targetWorkers - m_asyncScan->activeWorkers.load());
+
+    return make_ok();
+}
+
+void RegisterAudioPluginsScenario::startAsyncWorkers(int64_t count)
+{
+    const std::shared_ptr<AsyncScan> scan = m_asyncScan;
+    IF_ASSERT_FAILED(scan) {
+        return;
+    }
+
+    for (int64_t i = 0; i < count; ++i) {
+        scan->activeWorkers.fetch_add(1);
+        scan->workers.emplace_back([this, scan]() {
+            SCAN_TRACE() << "Background validation worker started";
+
+            while (!m_shuttingDown.load()) {
+                io::path_t pluginPath;
+                {
+                    std::lock_guard lock(scan->todoMutex);
+                    if (scan->todo.empty()) {
+                        break;
+                    }
+                    pluginPath = scan->todo.front();
+                    scan->todo.pop_front();
+                }
+                scan->dispatchedCount.fetch_add(1);
+
+                // "bg" prefix: must not collide with a concurrent interactive
+                // rescan, which numbers its result files from 0 too
+                const io::path_t resultFile = fileSystem()->temporaryDirectoryPath()
+                                              + "/muse_audioplugin_scan_bg_"
+                                              + std::to_string(scan->resultFileSeq.fetch_add(1)) + ".json";
+
+                // clear leftovers from a previous run
+                fileSystem()->remove(resultFile);
+
+                const int code = process()->execute(scan->appPath,
+                                                    { "--register-audio-plugin", pluginPath.toStdString(),
+                                                      "--register-audio-plugin-out", resultFile.toStdString() },
+                                                    AUDIO_PLUGIN_REGISTRATION_TIMEOUT_MS,
+                                                    [this]() { return m_shuttingDown.load(); });
+
+                async::Async::call(this, [this, pluginPath, resultFile, code]() {
+                    onAsyncScanResult(pluginPath, resultFile, code);
+                }, scan->mainThreadId);
+            }
+
+            const int64_t remainingWorkers = scan->activeWorkers.fetch_sub(1) - 1;
+            SCAN_TRACE() << "Background validation worker stopped: remainingWorkers=" << remainingWorkers;
+            if (remainingWorkers == 0) {
+                async::Async::call(this, [this]() {
+                    maybeFinishAsyncScan();
+                }, scan->mainThreadId);
+            }
+        });
+    }
+}
+
+void RegisterAudioPluginsScenario::onAsyncScanResult(const io::path_t& pluginPath, const io::path_t& resultFile, int code)
+{
+    if (!m_asyncScan) {
+        fileSystem()->remove(resultFile);
+        return;
+    }
+
+    ++m_asyncScan->doneCount;
+
+    if (code == IProcess::ExecuteCanceledCode) {
+        // shutdown: the Discovered placeholder stays, next launch re-validates it
+        SCAN_TRACE() << "Background validation result ignored after cancellation: pluginPath=" << pluginPath.toStdString();
+        fileSystem()->remove(resultFile);
+        maybeFinishAsyncScan();
+        return;
+    }
+
+    SCAN_TRACE() << "Background validation result: doneCount=" << m_asyncScan->doneCount
+                 << "/" << m_asyncScan->queuedCount
+                 << ", code=" << code
+                 << ", pluginPath=" << pluginPath.toStdString();
+
+    Ret ret = knownPluginsRegister()->unregisterPlugins({ placeholderIdFromPath(pluginPath) });
+    if (!ret) {
+        LOGE() << "Failed to remove plugin placeholder: " << ret.toString();
+    }
+
+    ret = knownPluginsRegister()->registerPlugins(scanResult(pluginPath, resultFile, code));
+    if (!ret) {
+        LOGE() << "Failed to register scanned plugins: " << ret.toString();
+    }
+
+    knownPluginsRegister()->pluginInfoListChanged().notify();
+
+    maybeFinishAsyncScan();
+}
+
+void RegisterAudioPluginsScenario::maybeFinishAsyncScan()
+{
+    if (!m_asyncScan) {
+        return;
+    }
+
+    if (m_asyncScan->activeWorkers.load() != 0) {
+        return;
+    }
+
+    if (m_asyncScan->doneCount < m_asyncScan->dispatchedCount.load()) {
+        // results are still queued for the main thread; the last one re-checks
+        return;
+    }
+
+    int64_t todoSize = 0;
+    {
+        std::lock_guard lock(m_asyncScan->todoMutex);
+        todoSize = static_cast<int64_t>(m_asyncScan->todo.size());
+    }
+    if (todoSize > 0 && !m_shuttingDown.load()) {
+        // paths were appended while the workers were winding down: restart
+        startAsyncWorkers(std::min(pluginScanConcurrency(), todoSize));
+        return;
+    }
+
+    for (std::thread& workerThread : m_asyncScan->workers) {
+        if (workerThread.joinable()) {
+            workerThread.join();
+        }
+    }
+
+    const int64_t doneCount = m_asyncScan->doneCount;
+    const int64_t queuedCount = m_asyncScan->queuedCount;
+    m_asyncScan.reset();
+
+    // authoritative reload of what the incremental flushes persisted (also notifies)
+    Ret ret = knownPluginsRegister()->load();
+    if (!ret) {
+        LOGE() << "Failed to reload the audio plugin registry: " << ret.toString();
+    }
+
+    SCAN_TRACE() << "Background plugin validation finished: doneCount=" << doneCount
+                 << ", queuedCount=" << queuedCount;
 }
 
 Ret RegisterAudioPluginsScenario::persistDiscoveredPlaceholders(const io::paths_t& pluginPaths)

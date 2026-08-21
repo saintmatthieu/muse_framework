@@ -83,3 +83,8 @@ void AudioPluginsContext::onInit(const IApplication::RunMode& mode)
         m_registerAudioPluginsScenario->markCrashedPluginsAsBroken();
     }
 }
+
+void AudioPluginsContext::onDeinit()
+{
+    m_registerAudioPluginsScenario->deinit();
+}

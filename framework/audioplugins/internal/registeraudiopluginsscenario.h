@@ -23,6 +23,7 @@
 #pragma once
 
 #include <atomic>
+#include <memory>
 
 #include "global/modularity/ioc.h"
 #include "global/iprocess.h"
@@ -55,6 +56,7 @@ public:
         : Contextable(iocCtx) {}
 
     void init();
+    void deinit();
 
     Ret markCrashedPluginsAsBroken();
 
@@ -64,12 +66,15 @@ public:
     Ret rescanAllPlugins() override;
 
     Ret registerNewPlugins(const io::paths_t& pluginPaths, bool validate) override;
+    Ret registerNewPluginsAsync(const io::paths_t& pluginPaths) override;
     Ret unregisterRemovedPlugins(const PluginResourceIdList& pluginIds) override;
 
     Ret registerPlugin(const io::path_t& pluginPath) override;
     Ret validatePlugin(const io::path_t& pluginPath, const io::path_t& outputFile) override;
 
 private:
+    struct AsyncScan;
+
     Ret persistDiscoveredPlaceholders(const io::paths_t& pluginPaths);
     void processPluginsRegistration(const io::paths_t& pluginPaths);
     AudioPluginInfoList scanResult(const io::path_t& pluginPath, const io::path_t& resultFile, int code) const;
@@ -79,7 +84,13 @@ private:
     IAudioPluginMetaReaderPtr metaReader(const io::path_t& pluginPath) const;
     PluginType metaType(const io::path_t& pluginPath) const;
 
+    void startAsyncWorkers(int64_t count);
+    void onAsyncScanResult(const io::path_t& pluginPath, const io::path_t& resultFile, int code);
+    void maybeFinishAsyncScan();
+
     Progress m_progress;
     std::atomic_bool m_aborted = false;
+    std::atomic_bool m_shuttingDown = false;
+    std::shared_ptr<AsyncScan> m_asyncScan;
 };
 }
