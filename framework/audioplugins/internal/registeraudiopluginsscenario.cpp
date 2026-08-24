@@ -69,6 +69,14 @@ int64_t pluginScanConcurrency()
     return concurrency > 0 ? static_cast<int64_t>(concurrency) : 1;
 }
 
+// A background scan competes with the responsive app (fork storms, cold-cache
+// disk reads of large plugin binaries), and its latency doesn't matter, so it
+// gets far fewer workers than the modal scan.
+int64_t backgroundPluginScanConcurrency()
+{
+    return std::min<int64_t>(4, pluginScanConcurrency());
+}
+
 void processProgressEvents()
 {
     if (QCoreApplication::instance()) {
@@ -339,7 +347,7 @@ Ret RegisterAudioPluginsScenario::registerNewPluginsAsync(const io::paths_t& plu
                  << ", queuedCount=" << m_asyncScan->queuedCount
                  << ", doneCount=" << m_asyncScan->doneCount;
 
-    const int64_t targetWorkers = std::min(pluginScanConcurrency(), todoSize);
+    const int64_t targetWorkers = std::min(backgroundPluginScanConcurrency(), todoSize);
     startAsyncWorkers(targetWorkers - m_asyncScan->activeWorkers.load());
 
     return make_ok();
@@ -459,7 +467,7 @@ void RegisterAudioPluginsScenario::maybeFinishAsyncScan()
     }
     if (todoSize > 0 && !m_shuttingDown.load()) {
         // paths were appended while the workers were winding down: restart
-        startAsyncWorkers(std::min(pluginScanConcurrency(), todoSize));
+        startAsyncWorkers(std::min(backgroundPluginScanConcurrency(), todoSize));
         return;
     }
 

@@ -21,6 +21,8 @@
  */
 #include "process.h"
 
+#include "../processspawnguard.h"
+
 #include "muse_framework_config.h"
 
 #ifdef QT_QPROCESS_SUPPORTED
@@ -32,6 +34,12 @@
 #include "log.h"
 
 using namespace muse;
+
+std::mutex& muse::processSpawnMutex()
+{
+    static std::mutex m;
+    return m;
+}
 
 #ifdef QT_QPROCESS_SUPPORTED
 static QStringList toQList(const std::vector<std::string>& args)
@@ -70,7 +78,11 @@ int Process::execute(const std::string& program, const std::vector<std::string>&
     QProcess process;
     QElapsedTimer elapsed;
     elapsed.start();
-    process.start(QString::fromStdString(program), toQList(args));
+    {
+        // the fork happens inside start(); see processSpawnMutex()
+        std::lock_guard lock(processSpawnMutex());
+        process.start(QString::fromStdString(program), toQList(args));
+    }
 
     if (!process.waitForStarted()) {
         return ExecuteStartFailedCode;
@@ -126,6 +138,7 @@ int Process::execute(const std::string& program, const std::vector<std::string>&
 bool Process::startDetached(const std::string& program, const std::vector<std::string>& args)
 {
 #ifdef QT_QPROCESS_SUPPORTED
+    std::lock_guard lock(processSpawnMutex());
     bool ok = QProcess::startDetached(QString::fromStdString(program), toQList(args));
     return ok;
 #else
