@@ -68,6 +68,7 @@ target_sources(muse_global PRIVATE
     allocator.h
     dlib.h
     iprocess.h
+    processspawnguard.h
     isysteminfo.h
     configreader.cpp
     configreader.h
