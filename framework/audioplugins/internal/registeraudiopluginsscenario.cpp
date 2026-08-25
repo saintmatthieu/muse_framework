@@ -29,6 +29,7 @@
 #include <condition_variable>
 #include <deque>
 #include <map>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -96,6 +97,7 @@ struct RegisterAudioPluginsScenario::AsyncScan {
 
     std::mutex todoMutex;
     std::deque<io::path_t> todo;
+    std::set<io::path_t> inFlight; // popped, result not yet processed
 
     std::atomic<int64_t> dispatchedCount { 0 };
     std::atomic<int64_t> activeWorkers { 0 };
@@ -321,36 +323,86 @@ Ret RegisterAudioPluginsScenario::registerNewPluginsAsync(const io::paths_t& plu
     // placeholders visible (e.g. in the plugin manager) right away
     knownPluginsRegister()->pluginInfoListChanged().notify();
 
-    if (!m_asyncScan) {
-        m_asyncScan = std::make_shared<AsyncScan>();
-        m_asyncScan->mainThreadId = std::this_thread::get_id();
-        m_asyncScan->appPath = globalConfiguration()->appBinPath().toStdString();
+    const int64_t added = enqueueForValidation(pluginPaths, /*front*/ false);
+    SCAN_TRACE() << "Queued plugin paths for background validation: added=" << added
+                 << ", queuedCount=" << m_asyncScan->queuedCount
+                 << ", doneCount=" << m_asyncScan->doneCount;
+
+    return make_ok();
+}
+
+bool RegisterAudioPluginsScenario::isValidatedInSession(const io::path_t& pluginPath) const
+{
+    return muse::contains(m_sessionValidatedPaths, pluginPath);
+}
+
+void RegisterAudioPluginsScenario::validatePluginAsync(const io::path_t& pluginPath)
+{
+    TRACEFUNC;
+
+    IF_ASSERT_FAILED(!pluginPath.empty()) {
+        return;
     }
+
+    if (isValidatedInSession(pluginPath)) {
+        return;
+    }
+
+    // the user is waiting for this one: front of the TODO list
+    const int64_t added = enqueueForValidation({ pluginPath }, /*front*/ true);
+    SCAN_TRACE() << "On-demand plugin validation requested: pluginPath=" << pluginPath.toStdString()
+                 << ", added=" << added
+                 << ", queuedCount=" << m_asyncScan->queuedCount
+                 << ", doneCount=" << m_asyncScan->doneCount;
+}
+
+async::Channel<io::path_t> RegisterAudioPluginsScenario::pluginValidationFinished() const
+{
+    return m_pluginValidationFinished;
+}
+
+void RegisterAudioPluginsScenario::ensureAsyncScan()
+{
+    if (m_asyncScan) {
+        return;
+    }
+
+    m_asyncScan = std::make_shared<AsyncScan>();
+    m_asyncScan->mainThreadId = std::this_thread::get_id();
+    m_asyncScan->appPath = globalConfiguration()->appBinPath().toStdString();
+}
+
+// Adds the paths to the TODO list (skipping duplicates and paths in flight)
+// and makes sure enough workers are running. Returns how many were added.
+int64_t RegisterAudioPluginsScenario::enqueueForValidation(const io::paths_t& pluginPaths, bool front)
+{
+    ensureAsyncScan();
 
     int64_t added = 0;
     int64_t todoSize = 0;
     {
-        // scanners may report the same path more than once; a TODO item must
-        // not be validated twice
         std::lock_guard lock(m_asyncScan->todoMutex);
         for (const io::path_t& path : pluginPaths) {
-            if (std::find(m_asyncScan->todo.cbegin(), m_asyncScan->todo.cend(), path) == m_asyncScan->todo.cend()) {
-                m_asyncScan->todo.push_back(path);
-                ++added;
+            const bool queued = std::find(m_asyncScan->todo.cbegin(), m_asyncScan->todo.cend(), path)
+                                != m_asyncScan->todo.cend();
+            if (queued || muse::contains(m_asyncScan->inFlight, path)) {
+                continue;
             }
+            if (front) {
+                m_asyncScan->todo.push_front(path);
+            } else {
+                m_asyncScan->todo.push_back(path);
+            }
+            ++added;
         }
         todoSize = static_cast<int64_t>(m_asyncScan->todo.size());
     }
     m_asyncScan->queuedCount += added;
 
-    SCAN_TRACE() << "Queued plugin paths for background validation: added=" << added
-                 << ", queuedCount=" << m_asyncScan->queuedCount
-                 << ", doneCount=" << m_asyncScan->doneCount;
-
     const int64_t targetWorkers = std::min(backgroundPluginScanConcurrency(), todoSize);
     startAsyncWorkers(targetWorkers - m_asyncScan->activeWorkers.load());
 
-    return make_ok();
+    return added;
 }
 
 void RegisterAudioPluginsScenario::startAsyncWorkers(int64_t count)
@@ -374,6 +426,7 @@ void RegisterAudioPluginsScenario::startAsyncWorkers(int64_t count)
                     }
                     pluginPath = scan->todo.front();
                     scan->todo.pop_front();
+                    scan->inFlight.insert(pluginPath);
                 }
                 scan->dispatchedCount.fetch_add(1);
 
@@ -415,12 +468,17 @@ void RegisterAudioPluginsScenario::onAsyncScanResult(const io::path_t& pluginPat
         return;
     }
 
+    {
+        std::lock_guard lock(m_asyncScan->todoMutex);
+        m_asyncScan->inFlight.erase(pluginPath);
+    }
     ++m_asyncScan->doneCount;
 
     if (code == IProcess::ExecuteCanceledCode) {
         // shutdown: the Discovered placeholder stays, next launch re-validates it
         SCAN_TRACE() << "Background validation result ignored after cancellation: pluginPath=" << pluginPath.toStdString();
         fileSystem()->remove(resultFile);
+        m_pluginValidationFinished.send(pluginPath);
         maybeFinishAsyncScan();
         return;
     }
@@ -430,17 +488,54 @@ void RegisterAudioPluginsScenario::onAsyncScanResult(const io::path_t& pluginPat
                  << ", code=" << code
                  << ", pluginPath=" << pluginPath.toStdString();
 
-    Ret ret = knownPluginsRegister()->unregisterPlugins({ placeholderIdFromPath(pluginPath) });
-    if (!ret) {
-        LOGE() << "Failed to remove plugin placeholder: " << ret.toString();
+    const RetVal<AudioPluginInfoList> result = readScanResult(pluginPath, resultFile, code);
+
+    // A startup scan validates Discovered placeholders (or nothing at all at
+    // this path); an on-demand validation re-checks a plugin the registry
+    // already knows as Validated.
+    const AudioPluginInfoList existing = knownPluginsRegister()->pluginInfoList([&pluginPath](const AudioPluginInfo& info) {
+        return info.path == pluginPath;
+    });
+    const bool knownValidated = std::any_of(existing.cbegin(), existing.cend(), [](const AudioPluginInfo& info) {
+        return info.state == AudioPluginState::Validated;
+    });
+
+    Ret ret = make_ok();
+    if (result.ret) {
+        m_sessionValidatedPaths.insert(pluginPath);
+        if (!knownValidated) {
+            ret = knownPluginsRegister()->removePluginsAtPath(pluginPath);
+            if (ret) {
+                ret = knownPluginsRegister()->registerPlugins(result.val);
+            }
+        }
+        // else: confirmed loadable, keep the existing entries (and their runtime attributes)
+    } else if (knownValidated) {
+        // a known plugin failed re-validation: keep its metadata, mark it broken
+        AudioPluginInfoList broken = existing;
+        PluginResourceIdList brokenIds;
+        for (AudioPluginInfo& info : broken) {
+            info.state = AudioPluginState::Error;
+            info.errorCode = code != 0 ? code : -1;
+            brokenIds.push_back(info.meta.id);
+        }
+        ret = knownPluginsRegister()->unregisterPlugins(brokenIds);
+        if (ret) {
+            ret = knownPluginsRegister()->registerPlugins(broken);
+        }
+    } else {
+        ret = knownPluginsRegister()->removePluginsAtPath(pluginPath);
+        if (ret) {
+            ret = knownPluginsRegister()->registerPlugins({ makeFailedPluginInfo(pluginPath, code) });
+        }
     }
 
-    ret = knownPluginsRegister()->registerPlugins(scanResult(pluginPath, resultFile, code));
     if (!ret) {
-        LOGE() << "Failed to register scanned plugins: " << ret.toString();
+        LOGE() << "Failed to update the registry for " << pluginPath.toStdString() << ": " << ret.toString();
     }
 
     knownPluginsRegister()->pluginInfoListChanged().notify();
+    m_pluginValidationFinished.send(pluginPath);
 
     maybeFinishAsyncScan();
 }
@@ -529,21 +624,30 @@ Ret RegisterAudioPluginsScenario::unregisterRemovedPlugins(const PluginResourceI
     return ret;
 }
 
-AudioPluginInfoList RegisterAudioPluginsScenario::scanResult(const io::path_t& pluginPath, const io::path_t& resultFile, int code) const
+RetVal<AudioPluginInfoList> RegisterAudioPluginsScenario::readScanResult(const io::path_t& pluginPath, const io::path_t& resultFile,
+                                                                         int code) const
 {
+    RetVal<AudioPluginInfoList> result;
     if (code == 0) {
-        RetVal<AudioPluginInfoList> res = knownPluginsRegister()->readPluginsFrom(resultFile);
-        if (res.ret) {
-            fileSystem()->remove(resultFile);
-            return res.val;
-        } else {
-            LOGE() << "Could not read scan result for " << pluginPath.toStdString() << ": " << res.ret.toString();
+        result = knownPluginsRegister()->readPluginsFrom(resultFile);
+        if (!result.ret) {
+            LOGE() << "Could not read scan result for " << pluginPath.toStdString() << ": " << result.ret.toString();
         }
     } else {
         LOGE() << "Could not register plugin: " << pluginPath.toStdString() << "\n error code: " << code;
+        result.ret = make_ret(Ret::Code::UnknownError);
     }
 
     fileSystem()->remove(resultFile);
+    return result;
+}
+
+AudioPluginInfoList RegisterAudioPluginsScenario::scanResult(const io::path_t& pluginPath, const io::path_t& resultFile, int code) const
+{
+    const RetVal<AudioPluginInfoList> result = readScanResult(pluginPath, resultFile, code);
+    if (result.ret) {
+        return result.val;
+    }
     return { makeFailedPluginInfo(pluginPath, code) };
 }
 
@@ -702,7 +806,13 @@ void RegisterAudioPluginsScenario::processPluginsRegistration(const io::paths_t&
         }
 
         completedPlaceholderIds.push_back(placeholderIdFromPath(pluginPaths[scan.index]));
-        appendPluginInfos(completedPluginInfo, scanResult(pluginPaths[scan.index], scan.resultFile, scan.code));
+        const RetVal<AudioPluginInfoList> result = readScanResult(pluginPaths[scan.index], scan.resultFile, scan.code);
+        if (result.ret) {
+            m_sessionValidatedPaths.insert(pluginPaths[scan.index]);
+            appendPluginInfos(completedPluginInfo, result.val);
+        } else {
+            completedPluginInfo.push_back(makeFailedPluginInfo(pluginPaths[scan.index], scan.code));
+        }
 
         m_progress.progress(doneCount, pluginCount, io::filename(pluginPaths[scan.index]).toStdString());
         processProgressEvents();
