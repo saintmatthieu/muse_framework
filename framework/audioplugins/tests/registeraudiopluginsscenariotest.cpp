@@ -37,6 +37,10 @@
 #include "mocks/audiopluginsloadguardmock.h"
 
 #include "translation.h"
+#include "global/async/processevents.h"
+
+#include <chrono>
+#include <thread>
 
 using ::testing::_;
 using ::testing::AnyNumber;
@@ -117,6 +121,31 @@ protected:
         ON_CALL(*m_knownPlugins, readPluginsFrom(_))
         .WillByDefault(Return(RetVal<AudioPluginInfoList>::make_ok({})));
     }
+
+    void TearDown() override
+    {
+        // joins any background validation workers
+        m_scenario->deinit();
+    }
+
+    // Background validation results are posted to this (main) thread's async
+    // queue; pump it until the predicate holds or the timeout expires.
+    static bool pumpUntil(const std::function<bool()>& predicate, std::chrono::milliseconds timeout = std::chrono::seconds(10))
+    {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (!predicate()) {
+            muse::async::processMessages();
+            if (std::chrono::steady_clock::now() > deadline) {
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        return true;
+    }
+
+    struct ValidationWaiter : public async::Asyncable {
+        paths_t finishedPaths;
+    };
 
     std::shared_ptr<RegisterAudioPluginsScenario> m_scenario;
     std::shared_ptr<GlobalConfigurationMock> m_globalConfiguration;
@@ -899,4 +928,138 @@ TEST_F(AudioPlugins_RegisterAudioPluginsScenarioTest, RegisterNewPlugins_Trailin
     EXPECT_FALSE(persisted.front().meta.id.empty());
     EXPECT_EQ(persisted.front().meta.id, lv2Path.toStdString());
     EXPECT_EQ(persisted.front().state, AudioPluginState::Discovered);
+}
+
+TEST_F(AudioPlugins_RegisterAudioPluginsScenarioTest, ValidatePluginAsync_KnownPluginSuccessKeepsEntriesAndMarksSession)
+{
+    // [GIVEN] A plugin the registry already knows as Validated from a previous session
+    const path_t pluginPath = "/some/path/Known.vst3";
+    AudioPluginInfo known;
+    known.meta.id = "Known";
+    known.meta.type = "VstPlugin";
+    known.path = pluginPath;
+    known.state = AudioPluginState::Validated;
+    ON_CALL(*m_knownPlugins, pluginInfoList(_))
+    .WillByDefault(Return(AudioPluginInfoList { known }));
+
+    EXPECT_FALSE(m_scenario->isValidatedInSession(pluginPath));
+
+    // [THEN] Exactly one validation subprocess runs, even though validation is requested twice
+    EXPECT_CALL(*m_process, execute(m_appPath,
+                                    ElementsAre("--register-audio-plugin", pluginPath.toStdString(), "--register-audio-plugin-out", _), _, _))
+    .WillOnce(Return(0));
+    EXPECT_CALL(*m_knownPlugins, readPluginsFrom(_))
+    .WillOnce(Return(RetVal<AudioPluginInfoList>::make_ok({ known })));
+
+    // [THEN] The existing entries are left alone (runtime attributes preserved)
+    EXPECT_CALL(*m_knownPlugins, removePluginsAtPath(_)).Times(0);
+    EXPECT_CALL(*m_knownPlugins, unregisterPlugins(_)).Times(0);
+    EXPECT_CALL(*m_knownPlugins, registerPlugins(_)).Times(0);
+    EXPECT_CALL(*m_knownPlugins, load()).WillOnce(Return(make_ok()));
+
+    ValidationWaiter waiter;
+    m_scenario->pluginValidationFinished().onReceive(&waiter, [&waiter](const path_t& path) {
+        waiter.finishedPaths.push_back(path);
+    });
+
+    // [WHEN] The plugin is about to be loaded for the first time in this session
+    m_scenario->validatePluginAsync(pluginPath);
+    m_scenario->validatePluginAsync(pluginPath); // already queued or in flight: no-op
+
+    // [THEN] The completion is signalled on the main thread and the path counts as validated in this session
+    ASSERT_TRUE(pumpUntil([&waiter]() { return !waiter.finishedPaths.empty(); }));
+    EXPECT_EQ(waiter.finishedPaths, paths_t { pluginPath });
+    EXPECT_TRUE(m_scenario->isValidatedInSession(pluginPath));
+
+    // [WHEN] Requested again after success
+    m_scenario->validatePluginAsync(pluginPath);
+
+    // [THEN] Nothing more happens (execute expectation above is WillOnce)
+    ASSERT_TRUE(pumpUntil([this]() { return m_scenario->isValidatedInSession("/some/path/Known.vst3"); }));
+    EXPECT_EQ(waiter.finishedPaths.size(), size_t(1));
+}
+
+TEST_F(AudioPlugins_RegisterAudioPluginsScenarioTest, ValidatePluginAsync_KnownPluginFailureMarksEntriesBroken)
+{
+    // [GIVEN] A plugin known as Validated whose re-validation subprocess fails
+    const path_t pluginPath = "/some/path/Flaky.vst3";
+    AudioPluginInfo known;
+    known.meta.id = "Flaky";
+    known.meta.type = "VstPlugin";
+    known.meta.attributes[u"title"] = u"Flaky";
+    known.path = pluginPath;
+    known.state = AudioPluginState::Validated;
+    ON_CALL(*m_knownPlugins, pluginInfoList(_))
+    .WillByDefault(Return(AudioPluginInfoList { known }));
+
+    EXPECT_CALL(*m_process, execute(m_appPath,
+                                    ElementsAre("--register-audio-plugin", pluginPath.toStdString(), "--register-audio-plugin-out", _), _, _))
+    .WillOnce(Return(-42));
+    EXPECT_CALL(*m_knownPlugins, load()).WillOnce(Return(make_ok()));
+
+    // [THEN] The entry is re-registered as broken, keeping its metadata
+    AudioPluginInfo broken = known;
+    broken.state = AudioPluginState::Error;
+    broken.errorCode = -42;
+    EXPECT_CALL(*m_knownPlugins, unregisterPlugins(PluginResourceIdList { "Flaky" }))
+    .WillOnce(Return(make_ok()));
+    EXPECT_CALL(*m_knownPlugins, registerPlugins(AudioPluginInfoList { broken }))
+    .WillOnce(Return(make_ok()));
+
+    ValidationWaiter waiter;
+    m_scenario->pluginValidationFinished().onReceive(&waiter, [&waiter](const path_t& path) {
+        waiter.finishedPaths.push_back(path);
+    });
+
+    // [WHEN]
+    m_scenario->validatePluginAsync(pluginPath);
+
+    // [THEN] Finished, but not validated in this session
+    ASSERT_TRUE(pumpUntil([&waiter]() { return !waiter.finishedPaths.empty(); }));
+    EXPECT_FALSE(m_scenario->isValidatedInSession(pluginPath));
+}
+
+TEST_F(AudioPlugins_RegisterAudioPluginsScenarioTest, RegisterNewPluginsAsync_ReplacesPlaceholderAndMarksSession)
+{
+    // [GIVEN] A path new to the registry (the placeholder persisted for it is Discovered)
+    const path_t pluginPath = "/some/path/New.vst3";
+    AudioPluginInfo placeholder;
+    placeholder.meta.id = "New";
+    placeholder.meta.type = "VstPlugin";
+    placeholder.path = pluginPath;
+    placeholder.state = AudioPluginState::Discovered;
+    ON_CALL(*m_knownPlugins, pluginInfoList(_))
+    .WillByDefault(Return(AudioPluginInfoList { placeholder }));
+
+    AudioPluginInfo validated = placeholder;
+    validated.meta.attributes[u"title"] = u"New";
+    validated.state = AudioPluginState::Validated;
+
+    EXPECT_CALL(*m_process, execute(m_appPath,
+                                    ElementsAre("--register-audio-plugin", pluginPath.toStdString(), "--register-audio-plugin-out", _), _, _))
+    .WillOnce(Return(0));
+    EXPECT_CALL(*m_knownPlugins, readPluginsFrom(_))
+    .WillOnce(Return(RetVal<AudioPluginInfoList>::make_ok({ validated })));
+
+    // [THEN] Placeholder persisted, then replaced by the validated result
+    EXPECT_CALL(*m_knownPlugins, removePluginsAtPath(pluginPath))
+    .Times(2)
+    .WillRepeatedly(Return(make_ok()));
+    EXPECT_CALL(*m_knownPlugins, registerPlugins(AudioPluginInfoList { placeholder }))
+    .WillOnce(Return(make_ok()));
+    EXPECT_CALL(*m_knownPlugins, registerPlugins(AudioPluginInfoList { validated }))
+    .WillOnce(Return(make_ok()));
+    EXPECT_CALL(*m_knownPlugins, load()).WillOnce(Return(make_ok()));
+
+    ValidationWaiter waiter;
+    m_scenario->pluginValidationFinished().onReceive(&waiter, [&waiter](const path_t& path) {
+        waiter.finishedPaths.push_back(path);
+    });
+
+    // [WHEN] Registered at startup, in the background
+    EXPECT_TRUE(m_scenario->registerNewPluginsAsync({ pluginPath }));
+
+    // [THEN] Returned immediately; the result arrives later and the plugin needs no re-validation when loaded
+    ASSERT_TRUE(pumpUntil([&waiter]() { return !waiter.finishedPaths.empty(); }));
+    EXPECT_TRUE(m_scenario->isValidatedInSession(pluginPath));
 }
