@@ -24,6 +24,7 @@
 
 #include <atomic>
 #include <memory>
+#include <set>
 
 #include "global/modularity/ioc.h"
 #include "global/iprocess.h"
@@ -67,6 +68,9 @@ public:
 
     Ret registerNewPlugins(const io::paths_t& pluginPaths, bool validate) override;
     Ret registerNewPluginsAsync(const io::paths_t& pluginPaths) override;
+    bool isValidatedInSession(const io::path_t& pluginPath) const override;
+    void validatePluginAsync(const io::path_t& pluginPath) override;
+    async::Channel<io::path_t> pluginValidationFinished() const override;
     Ret unregisterRemovedPlugins(const PluginResourceIdList& pluginIds) override;
 
     Ret registerPlugin(const io::path_t& pluginPath) override;
@@ -84,13 +88,20 @@ private:
     IAudioPluginMetaReaderPtr metaReader(const io::path_t& pluginPath) const;
     PluginType metaType(const io::path_t& pluginPath) const;
 
+    void ensureAsyncScan();
+    int64_t enqueueForValidation(const io::paths_t& pluginPaths, bool front);
     void startAsyncWorkers(int64_t count);
     void onAsyncScanResult(const io::path_t& pluginPath, const io::path_t& resultFile, int code);
     void maybeFinishAsyncScan();
+    RetVal<AudioPluginInfoList> readScanResult(const io::path_t& pluginPath, const io::path_t& resultFile, int code) const;
 
     Progress m_progress;
     std::atomic_bool m_aborted = false;
     std::atomic_bool m_shuttingDown = false;
     std::shared_ptr<AsyncScan> m_asyncScan;
+
+    // main thread only
+    std::set<io::path_t> m_sessionValidatedPaths;
+    async::Channel<io::path_t> m_pluginValidationFinished;
 };
 }

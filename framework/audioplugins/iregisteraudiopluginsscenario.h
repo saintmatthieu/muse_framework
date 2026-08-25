@@ -27,6 +27,7 @@
 #include "global/types/ret.h"
 #include "global/io/path.h"
 #include "global/progress.h"
+#include "global/async/channel.h"
 #include "audiopluginstypes.h"
 
 namespace muse::audioplugins {
@@ -55,6 +56,21 @@ public:
     // (with pluginInfoListChanged notifications) as they arrive. If a
     // background validation is already running, the paths join its queue.
     virtual Ret registerNewPluginsAsync(const io::paths_t& pluginPaths) = 0;
+
+    // Validate-on-first-use: a plugin path is "validated in this session" once a
+    // validation subprocess succeeded on it since the app started (at startup
+    // for new plugins, or on demand). Loading a third-party plugin in-process
+    // for the first time in a session should first go through this.
+    virtual bool isValidatedInSession(const io::path_t& pluginPath) const = 0;
+
+    // Queues a known plugin path at the front of the background TODO list.
+    // No-op if it is already queued, in flight, or validated in this session.
+    // On success the registry entries are kept; on failure they are marked Error.
+    virtual void validatePluginAsync(const io::path_t& pluginPath) = 0;
+
+    // Sent on the main thread when a path's background validation has finished,
+    // whatever the outcome (check isValidatedInSession for the result).
+    virtual async::Channel<io::path_t> pluginValidationFinished() const = 0;
     virtual Ret unregisterRemovedPlugins(const PluginResourceIdList& pluginIds) = 0;
 
     virtual Ret registerPlugin(const io::path_t& pluginPath) = 0;
