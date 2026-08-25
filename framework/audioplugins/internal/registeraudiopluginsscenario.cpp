@@ -85,7 +85,7 @@ void processProgressEvents()
     }
 }
 
-constexpr int AUDIO_PLUGIN_REGISTRATION_TIMEOUT_MS = 15000;
+constexpr int AUDIO_PLUGIN_REGISTRATION_TIMEOUT_MS = 3 * 60000; // Three minutes
 }
 
 // Shared TODO list for background validation: worker threads pop one path at
