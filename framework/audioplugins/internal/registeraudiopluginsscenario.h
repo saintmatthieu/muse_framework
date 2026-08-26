@@ -71,6 +71,8 @@ public:
     bool isValidatedInSession(const io::path_t& pluginPath) const override;
     void validatePluginAsync(const io::path_t& pluginPath) override;
     async::Channel<io::path_t> pluginValidationFinished() const override;
+    bool isValidating() const override;
+    async::Notification pluginValidationScanFinished() const override;
     Ret unregisterRemovedPlugins(const PluginResourceIdList& pluginIds) override;
 
     Ret registerPlugin(const io::path_t& pluginPath) override;
@@ -103,5 +105,6 @@ private:
     // main thread only
     std::set<io::path_t> m_sessionValidatedPaths;
     async::Channel<io::path_t> m_pluginValidationFinished;
+    async::Notification m_pluginValidationScanFinished;
 };
 }

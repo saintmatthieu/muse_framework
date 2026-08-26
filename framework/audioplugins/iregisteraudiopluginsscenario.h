@@ -28,6 +28,7 @@
 #include "global/io/path.h"
 #include "global/progress.h"
 #include "global/async/channel.h"
+#include "global/async/notification.h"
 #include "audiopluginstypes.h"
 
 namespace muse::audioplugins {
@@ -71,6 +72,14 @@ public:
     // Sent on the main thread when a path's background validation has finished,
     // whatever the outcome (check isValidatedInSession for the result).
     virtual async::Channel<io::path_t> pluginValidationFinished() const = 0;
+
+    // True while a background validation scan is in progress (its TODO queue is
+    // not yet drained). Main thread only.
+    virtual bool isValidating() const = 0;
+
+    // Sent on the main thread when a background validation scan has fully
+    // finished (queue drained). Useful to reflect scan progress in the UI.
+    virtual async::Notification pluginValidationScanFinished() const = 0;
     virtual Ret unregisterRemovedPlugins(const PluginResourceIdList& pluginIds) = 0;
 
     virtual Ret registerPlugin(const io::path_t& pluginPath) = 0;
