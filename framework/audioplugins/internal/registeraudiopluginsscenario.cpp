@@ -361,6 +361,16 @@ async::Channel<io::path_t> RegisterAudioPluginsScenario::pluginValidationFinishe
     return m_pluginValidationFinished;
 }
 
+bool RegisterAudioPluginsScenario::isValidating() const
+{
+    return m_asyncScan != nullptr;
+}
+
+async::Notification RegisterAudioPluginsScenario::pluginValidationScanFinished() const
+{
+    return m_pluginValidationScanFinished;
+}
+
 void RegisterAudioPluginsScenario::ensureAsyncScan()
 {
     if (m_asyncScan) {
@@ -584,6 +594,10 @@ void RegisterAudioPluginsScenario::maybeFinishAsyncScan()
 
     SCAN_TRACE() << "Background plugin validation finished: doneCount=" << doneCount
                  << ", queuedCount=" << queuedCount;
+
+    if (!m_shuttingDown.load()) {
+        m_pluginValidationScanFinished.notify();
+    }
 }
 
 Ret RegisterAudioPluginsScenario::persistDiscoveredPlaceholders(const io::paths_t& pluginPaths)
