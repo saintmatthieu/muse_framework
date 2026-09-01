@@ -81,9 +81,20 @@ StyledDialogView {
             text: model.statusMessage
         }
 
+        // Indeterminate operations (a single item, e.g. validating one plugin)
+        // never drive `to`, so show a spinner rather than a bar stuck at 0%.
+        StyledBusyIndicator {
+            Layout.alignment: Qt.AlignHCenter
+
+            visible: model.to === 0
+            running: visible
+        }
+
         ProgressBar {
             Layout.fillWidth: true
             Layout.preferredHeight: 30
+
+            visible: model.to !== 0
 
             from: model.from
             value: model.value
