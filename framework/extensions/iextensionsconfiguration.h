@@ -40,8 +40,8 @@ public:
     virtual io::path_t defaultPath() const = 0;
     virtual io::path_t userPath() const = 0;
 
-    virtual Ret setManifestConfigs(const std::map<Uri, Manifest::Config>& configs) = 0;
-    virtual std::map<Uri, Manifest::Config> manifestConfigs() const = 0;
+    virtual Ret setExtensionConfigs(const std::map<Uri, ExtensionConfig>& configs) = 0;
+    virtual std::map<Uri, ExtensionConfig> extensionConfigs() const = 0;
 
     // legacy plugins
     virtual io::path_t pluginsDefaultPath() const = 0;

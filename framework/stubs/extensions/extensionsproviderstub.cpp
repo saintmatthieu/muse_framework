@@ -52,28 +52,27 @@ const Manifest& ExtensionsProviderStub::manifest(const Uri&) const
     return m;
 }
 
-async::Channel<Manifest> ExtensionsProviderStub::manifestChanged() const
+void ExtensionsProviderStub::setEnabled(const ExtensionUri&, bool)
 {
-    static async::Channel<Manifest> c;
+}
+
+bool ExtensionsProviderStub::isEnabled(const ExtensionUri&) const
+{
+    return false;
+}
+
+async::Channel<ExtensionUri> ExtensionsProviderStub::enabledChanged() const
+{
+    static async::Channel<ExtensionUri> c;
     return c;
 }
 
-Action ExtensionsProviderStub::action(const UriQuery&) const
-{
-    return Action();
-}
-
-KnownCategories ExtensionsProviderStub::knownCategories() const
-{
-    return KnownCategories();
-}
-
-Ret ExtensionsProviderStub::perform(const UriQuery&)
+Ret ExtensionsProviderStub::perform(const ExtensionUri&, const ExtensionActionCode&)
 {
     return muse::make_ret(Ret::Code::NotSupported);
 }
 
-Ret ExtensionsProviderStub::run(const UriQuery&)
+Ret ExtensionsProviderStub::run(const ExtensionUri&, const ExtensionActionCode&)
 {
     return muse::make_ret(Ret::Code::NotSupported);
 }
@@ -81,23 +80,4 @@ Ret ExtensionsProviderStub::run(const UriQuery&)
 std::unique_ptr<IExtensionSession> ExtensionsProviderStub::newSession(const Uri&, const io::path_t&) const
 {
     return {};
-}
-
-Ret ExtensionsProviderStub::setExecPoint(const Uri&, const ExecPointName&)
-{
-    return muse::make_ret(Ret::Code::NotSupported);
-}
-
-std::vector<ExecPoint> ExtensionsProviderStub::execPoints(const Uri&) const
-{
-    return std::vector<ExecPoint>();
-}
-
-Ret ExtensionsProviderStub::performPoint(const ExecPointName&)
-{
-    return muse::make_ret(Ret::Code::Ok);
-}
-
-void ExtensionsProviderStub::performPointAsync(const ExecPointName&)
-{
 }
