@@ -409,8 +409,12 @@ int64_t RegisterAudioPluginsScenario::enqueueForValidation(const io::paths_t& pl
     }
     m_asyncScan->queuedCount += added;
 
-    const int64_t targetWorkers = std::min(backgroundPluginScanConcurrency(), todoSize);
-    startAsyncWorkers(targetWorkers - m_asyncScan->activeWorkers.load());
+    // Top up the workers: every in-flight path already has one, so only the paths
+    // still waiting need a worker, up to the remaining concurrency. (Deriving the target
+    // from the TODO size alone and subtracting the busy workers serialized on-demand
+    // validations behind a single hung plugin.)
+    const int64_t idleCapacity = backgroundPluginScanConcurrency() - m_asyncScan->activeWorkers.load();
+    startAsyncWorkers(std::max<int64_t>(0, std::min(idleCapacity, todoSize)));
 
     return added;
 }
