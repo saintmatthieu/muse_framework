@@ -83,6 +83,7 @@ signals:
     void topPaddingChanged();
     void bottomPaddingChanged();
     void minimumWidthChanged();
+    void viewLoadFailed();
 
 private:
     void deinitPluginView();

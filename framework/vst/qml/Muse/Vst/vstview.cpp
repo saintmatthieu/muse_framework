@@ -125,6 +125,7 @@ void VstView::init()
 {
     m_instance = instancesRegister()->instanceById(m_instanceId);
     IF_ASSERT_FAILED(m_instance) {
+        emit viewLoadFailed();
         return;
     }
 
@@ -133,10 +134,15 @@ void VstView::init()
 
     m_view = m_instance->createView();
     if (!m_view) {
+        // The plugin doesn't provide an editor (createView returned null).
+        LOGI() << "VST plugin has no view, instance name: " << m_instance->name();
+        emit viewLoadFailed();
         return;
     }
 
     if (m_view->isPlatformTypeSupported(currentPlatformUiType()) != Steinberg::kResultTrue) {
+        LOGW() << "VST plugin view doesn't support this platform UI type, instance name: " << m_instance->name();
+        emit viewLoadFailed();
         return;
     }
 
@@ -151,6 +157,7 @@ void VstView::init()
     if (attached != Steinberg::kResultOk) {
         LOGE() << "Unable to attach vst plugin view to window"
                << ", instance name: " << m_instance->name();
+        emit viewLoadFailed();
         return;
     }
 
