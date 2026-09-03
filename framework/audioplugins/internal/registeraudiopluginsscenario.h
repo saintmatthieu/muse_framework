@@ -92,7 +92,7 @@ private:
 
     void ensureAsyncScan();
     int64_t enqueueForValidation(const io::paths_t& pluginPaths, bool front);
-    void startAsyncWorkers(int64_t count);
+    void startAsyncWorkers(int64_t maxCount);
     void onAsyncScanResult(const io::path_t& pluginPath, const io::path_t& resultFile, int code);
     void maybeFinishAsyncScan();
     RetVal<AudioPluginInfoList> readScanResult(const io::path_t& pluginPath, const io::path_t& resultFile, int code) const;

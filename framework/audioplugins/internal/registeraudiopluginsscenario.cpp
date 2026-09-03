@@ -107,6 +107,22 @@ struct RegisterAudioPluginsScenario::AsyncScan {
     std::vector<std::thread> workers;
     int64_t queuedCount = 0;
     int64_t doneCount = 0;
+
+    //! Hands the next waiting path to a worker; it is in flight from then on. Called by
+    //! the main thread when spawning a worker (see startAsyncWorkers) and by the worker
+    //! itself when looping.
+    bool claimNext(io::path_t& pluginPath)
+    {
+        std::lock_guard lock(todoMutex);
+        if (todo.empty()) {
+            return false;
+        }
+        pluginPath = todo.front();
+        todo.pop_front();
+        inFlight.insert(pluginPath);
+        dispatchedCount.fetch_add(1);
+        return true;
+    }
 };
 
 void RegisterAudioPluginsScenario::init()
@@ -389,7 +405,6 @@ int64_t RegisterAudioPluginsScenario::enqueueForValidation(const io::paths_t& pl
     ensureAsyncScan();
 
     int64_t added = 0;
-    int64_t todoSize = 0;
     {
         std::lock_guard lock(m_asyncScan->todoMutex);
         for (const io::path_t& path : pluginPaths) {
@@ -405,44 +420,48 @@ int64_t RegisterAudioPluginsScenario::enqueueForValidation(const io::paths_t& pl
             }
             ++added;
         }
-        todoSize = static_cast<int64_t>(m_asyncScan->todo.size());
     }
     m_asyncScan->queuedCount += added;
 
-    // Top up the workers: every in-flight path already has one, so only the paths
-    // still waiting need a worker, up to the remaining concurrency. (Deriving the target
-    // from the TODO size alone and subtracting the busy workers serialized on-demand
-    // validations behind a single hung plugin.)
-    const int64_t idleCapacity = backgroundPluginScanConcurrency() - m_asyncScan->activeWorkers.load();
-    startAsyncWorkers(std::max<int64_t>(0, std::min(idleCapacity, todoSize)));
+    // Top up the workers, up to the remaining concurrency. startAsyncWorkers starts one
+    // per path it can claim, so this neither serializes on-demand validations behind a
+    // busy worker (the busy ones are already accounted for) nor starts idle workers for
+    // paths a running worker is about to pop.
+    startAsyncWorkers(backgroundPluginScanConcurrency() - m_asyncScan->activeWorkers.load());
 
     return added;
 }
 
-void RegisterAudioPluginsScenario::startAsyncWorkers(int64_t count)
+void RegisterAudioPluginsScenario::startAsyncWorkers(int64_t maxCount)
 {
     const std::shared_ptr<AsyncScan> scan = m_asyncScan;
     IF_ASSERT_FAILED(scan) {
         return;
     }
 
-    for (int64_t i = 0; i < count; ++i) {
+    for (int64_t i = 0; i < maxCount; ++i) {
+        // A worker is started only for a path claimed here, on the main thread, so it
+        // never starts idle. Besides keeping the worker count exact, this guarantees
+        // that a worker's first message to the main thread is a result, sent while it
+        // is still counted active. That matters: a thread's first message registers a
+        // queue port under the main thread's port mutex, which processMessages holds
+        // while dispatching - and maybeFinishAsyncScan joins the workers from within
+        // such a dispatch, once none is active. A worker that started idle would post
+        // its first message (the finish check) exactly then, and deadlock the join.
+        io::path_t firstPath;
+        if (!scan->claimNext(firstPath)) {
+            break;
+        }
+
         scan->activeWorkers.fetch_add(1);
-        scan->workers.emplace_back([this, scan]() {
+        scan->workers.emplace_back([this, scan, firstPath]() {
             SCAN_TRACE() << "Background validation worker started";
 
+            io::path_t pluginPath = firstPath;
             while (!m_shuttingDown.load()) {
-                io::path_t pluginPath;
-                {
-                    std::lock_guard lock(scan->todoMutex);
-                    if (scan->todo.empty()) {
-                        break;
-                    }
-                    pluginPath = scan->todo.front();
-                    scan->todo.pop_front();
-                    scan->inFlight.insert(pluginPath);
+                if (pluginPath.empty() && !scan->claimNext(pluginPath)) {
+                    break;
                 }
-                scan->dispatchedCount.fetch_add(1);
 
                 // "bg" prefix: must not collide with a concurrent interactive
                 // rescan, which numbers its result files from 0 too
@@ -462,6 +481,8 @@ void RegisterAudioPluginsScenario::startAsyncWorkers(int64_t count)
                 async::Async::call(this, [this, pluginPath, resultFile, code]() {
                     onAsyncScanResult(pluginPath, resultFile, code);
                 }, scan->mainThreadId);
+
+                pluginPath = io::path_t();
             }
 
             const int64_t remainingWorkers = scan->activeWorkers.fetch_sub(1) - 1;
@@ -576,7 +597,7 @@ void RegisterAudioPluginsScenario::maybeFinishAsyncScan()
     }
     if (todoSize > 0 && !m_shuttingDown.load()) {
         // paths were appended while the workers were winding down: restart
-        startAsyncWorkers(std::min(backgroundPluginScanConcurrency(), todoSize));
+        startAsyncWorkers(backgroundPluginScanConcurrency());
         return;
     }
 

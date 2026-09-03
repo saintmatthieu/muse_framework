@@ -147,6 +147,7 @@ protected:
 
     struct ValidationWaiter : public async::Asyncable {
         paths_t finishedPaths;
+        bool scanFinished = false;
     };
 
     std::shared_ptr<RegisterAudioPluginsScenario> m_scenario;
@@ -964,6 +965,9 @@ TEST_F(AudioPlugins_RegisterAudioPluginsScenarioTest, ValidatePluginAsync_KnownP
     m_scenario->pluginValidationFinished().onReceive(&waiter, [&waiter](const path_t& path) {
         waiter.finishedPaths.push_back(path);
     });
+    m_scenario->pluginValidationScanFinished().onNotify(&waiter, [&waiter]() {
+        waiter.scanFinished = true;
+    });
 
     // [WHEN] The plugin is about to be loaded for the first time in this session
     m_scenario->validatePluginAsync(pluginPath);
@@ -980,6 +984,10 @@ TEST_F(AudioPlugins_RegisterAudioPluginsScenarioTest, ValidatePluginAsync_KnownP
     // [THEN] Nothing more happens (execute expectation above is WillOnce)
     ASSERT_TRUE(pumpUntil([this]() { return m_scenario->isValidatedInSession("/some/path/Known.vst3"); }));
     EXPECT_EQ(waiter.finishedPaths.size(), size_t(1));
+
+    // [THEN] The scan finalizes - reloading the registry - once its worker has exited,
+    // which may be after the last completion was signalled
+    ASSERT_TRUE(pumpUntil([&waiter]() { return waiter.scanFinished; }));
 }
 
 TEST_F(AudioPlugins_RegisterAudioPluginsScenarioTest, ValidatePluginAsync_KnownPluginFailureMarksEntriesBroken)
@@ -1014,6 +1022,9 @@ TEST_F(AudioPlugins_RegisterAudioPluginsScenarioTest, ValidatePluginAsync_KnownP
     m_scenario->pluginValidationFinished().onReceive(&waiter, [&waiter](const path_t& path) {
         waiter.finishedPaths.push_back(path);
     });
+    m_scenario->pluginValidationScanFinished().onNotify(&waiter, [&waiter]() {
+        waiter.scanFinished = true;
+    });
 
     // [WHEN]
     m_scenario->validatePluginAsync(pluginPath);
@@ -1021,6 +1032,10 @@ TEST_F(AudioPlugins_RegisterAudioPluginsScenarioTest, ValidatePluginAsync_KnownP
     // [THEN] Finished, but not validated in this session
     ASSERT_TRUE(pumpUntil([&waiter]() { return !waiter.finishedPaths.empty(); }));
     EXPECT_FALSE(m_scenario->isValidatedInSession(pluginPath));
+
+    // [THEN] The scan finalizes - reloading the registry - once its worker has exited,
+    // which may be after the last completion was signalled
+    ASSERT_TRUE(pumpUntil([&waiter]() { return waiter.scanFinished; }));
 }
 
 TEST_F(AudioPlugins_RegisterAudioPluginsScenarioTest, RegisterNewPluginsAsync_ReplacesPlaceholderAndMarksSession)
@@ -1060,6 +1075,9 @@ TEST_F(AudioPlugins_RegisterAudioPluginsScenarioTest, RegisterNewPluginsAsync_Re
     m_scenario->pluginValidationFinished().onReceive(&waiter, [&waiter](const path_t& path) {
         waiter.finishedPaths.push_back(path);
     });
+    m_scenario->pluginValidationScanFinished().onNotify(&waiter, [&waiter]() {
+        waiter.scanFinished = true;
+    });
 
     // [WHEN] Registered at startup, in the background
     EXPECT_TRUE(m_scenario->registerNewPluginsAsync({ pluginPath }));
@@ -1067,6 +1085,10 @@ TEST_F(AudioPlugins_RegisterAudioPluginsScenarioTest, RegisterNewPluginsAsync_Re
     // [THEN] Returned immediately; the result arrives later and the plugin needs no re-validation when loaded
     ASSERT_TRUE(pumpUntil([&waiter]() { return !waiter.finishedPaths.empty(); }));
     EXPECT_TRUE(m_scenario->isValidatedInSession(pluginPath));
+
+    // [THEN] The scan finalizes - reloading the registry - once its worker has exited,
+    // which may be after the last completion was signalled
+    ASSERT_TRUE(pumpUntil([&waiter]() { return waiter.scanFinished; }));
 }
 
 TEST_F(AudioPlugins_RegisterAudioPluginsScenarioTest, ValidatePluginAsync_SecondPluginIsNotQueuedBehindAHungOne)
@@ -1118,6 +1140,9 @@ TEST_F(AudioPlugins_RegisterAudioPluginsScenarioTest, ValidatePluginAsync_Second
     ValidationWaiter waiter;
     m_scenario->pluginValidationFinished().onReceive(&waiter, [&waiter](const path_t& path) {
         waiter.finishedPaths.push_back(path);
+    });
+    m_scenario->pluginValidationScanFinished().onNotify(&waiter, [&waiter]() {
+        waiter.scanFinished = true;
     });
     const auto finished = [&waiter](const path_t& path) {
         return std::find(waiter.finishedPaths.cbegin(), waiter.finishedPaths.cend(), path) != waiter.finishedPaths.cend();
