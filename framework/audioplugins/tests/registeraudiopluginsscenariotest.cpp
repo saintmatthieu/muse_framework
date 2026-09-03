@@ -39,6 +39,8 @@
 #include "translation.h"
 #include "global/async/processevents.h"
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <thread>
 
@@ -946,7 +948,8 @@ TEST_F(AudioPlugins_RegisterAudioPluginsScenarioTest, ValidatePluginAsync_KnownP
 
     // [THEN] Exactly one validation subprocess runs, even though validation is requested twice
     EXPECT_CALL(*m_process, execute(m_appPath,
-                                    ElementsAre("--register-audio-plugin", pluginPath.toStdString(), "--register-audio-plugin-out", _), _, _))
+                                    ElementsAre("--register-audio-plugin",
+                                                pluginPath.toStdString(), "--register-audio-plugin-out", _), _, _))
     .WillOnce(Return(0));
     EXPECT_CALL(*m_knownPlugins, readPluginsFrom(_))
     .WillOnce(Return(RetVal<AudioPluginInfoList>::make_ok({ known })));
@@ -993,7 +996,8 @@ TEST_F(AudioPlugins_RegisterAudioPluginsScenarioTest, ValidatePluginAsync_KnownP
     .WillByDefault(Return(AudioPluginInfoList { known }));
 
     EXPECT_CALL(*m_process, execute(m_appPath,
-                                    ElementsAre("--register-audio-plugin", pluginPath.toStdString(), "--register-audio-plugin-out", _), _, _))
+                                    ElementsAre("--register-audio-plugin",
+                                                pluginPath.toStdString(), "--register-audio-plugin-out", _), _, _))
     .WillOnce(Return(-42));
     EXPECT_CALL(*m_knownPlugins, load()).WillOnce(Return(make_ok()));
 
@@ -1036,7 +1040,8 @@ TEST_F(AudioPlugins_RegisterAudioPluginsScenarioTest, RegisterNewPluginsAsync_Re
     validated.state = AudioPluginState::Validated;
 
     EXPECT_CALL(*m_process, execute(m_appPath,
-                                    ElementsAre("--register-audio-plugin", pluginPath.toStdString(), "--register-audio-plugin-out", _), _, _))
+                                    ElementsAre("--register-audio-plugin",
+                                                pluginPath.toStdString(), "--register-audio-plugin-out", _), _, _))
     .WillOnce(Return(0));
     EXPECT_CALL(*m_knownPlugins, readPluginsFrom(_))
     .WillOnce(Return(RetVal<AudioPluginInfoList>::make_ok({ validated })));
@@ -1062,4 +1067,79 @@ TEST_F(AudioPlugins_RegisterAudioPluginsScenarioTest, RegisterNewPluginsAsync_Re
     // [THEN] Returned immediately; the result arrives later and the plugin needs no re-validation when loaded
     ASSERT_TRUE(pumpUntil([&waiter]() { return !waiter.finishedPaths.empty(); }));
     EXPECT_TRUE(m_scenario->isValidatedInSession(pluginPath));
+}
+
+TEST_F(AudioPlugins_RegisterAudioPluginsScenarioTest, ValidatePluginAsync_SecondPluginIsNotQueuedBehindAHungOne)
+{
+    // [GIVEN] Two plugins the registry knows as Validated from a previous session
+    const path_t hungPath = "/some/path/Hung.vst3";
+    const path_t otherPath = "/some/path/Other.vst3";
+    AudioPluginInfo hung;
+    hung.meta.id = "Hung";
+    hung.meta.type = "VstPlugin";
+    hung.path = hungPath;
+    hung.state = AudioPluginState::Validated;
+    AudioPluginInfo other = hung;
+    other.meta.id = "Other";
+    other.path = otherPath;
+    ON_CALL(*m_knownPlugins, pluginInfoList(_))
+    .WillByDefault(Return(AudioPluginInfoList { hung, other }));
+    ON_CALL(*m_knownPlugins, readPluginsFrom(_))
+    .WillByDefault(Return(RetVal<AudioPluginInfoList>::make_ok({ hung, other })));
+    ON_CALL(*m_knownPlugins, load()).WillByDefault(Return(make_ok()));
+
+    // [GIVEN] The first plugin hangs while loading: its validation subprocess doesn't
+    // return until released (or the scan is cancelled, so a failing test can't hang)
+    std::atomic<bool> hungEntered { false };
+    std::atomic<bool> released { false };
+    struct ReleaseOnExit {
+        std::atomic<bool>& flag;
+        ~ReleaseOnExit() { flag.store(true); }
+    } releaseOnExit { released };
+
+    EXPECT_CALL(*m_process, execute(m_appPath,
+                                    ElementsAre("--register-audio-plugin", hungPath.toStdString(), "--register-audio-plugin-out", _), _, _))
+    .WillOnce([&hungEntered, &released](const std::string&, const std::vector<std::string>&, int,
+                                        const std::function<bool()>& cancelled) {
+        hungEntered.store(true);
+        while (!released.load()) {
+            if (cancelled()) {
+                return IProcess::ExecuteCanceledCode;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        return 0;
+    });
+    EXPECT_CALL(*m_process, execute(m_appPath,
+                                    ElementsAre("--register-audio-plugin", otherPath.toStdString(), "--register-audio-plugin-out", _), _,
+                                    _))
+    .WillOnce(Return(0));
+
+    ValidationWaiter waiter;
+    m_scenario->pluginValidationFinished().onReceive(&waiter, [&waiter](const path_t& path) {
+        waiter.finishedPaths.push_back(path);
+    });
+    const auto finished = [&waiter](const path_t& path) {
+        return std::find(waiter.finishedPaths.cbegin(), waiter.finishedPaths.cend(), path) != waiter.finishedPaths.cend();
+    };
+
+    // [WHEN] The hung plugin is requested first and its validation is under way
+    m_scenario->validatePluginAsync(hungPath);
+    ASSERT_TRUE(pumpUntil([&hungEntered]() { return hungEntered.load(); }));
+
+    // [WHEN] Another plugin is requested while the first one is still hung
+    m_scenario->validatePluginAsync(otherPath);
+
+    // [THEN] It gets a worker of its own: it finishes although the first one is still hung
+    ASSERT_TRUE(pumpUntil([&finished, &otherPath]() { return finished(otherPath); }, std::chrono::seconds(5)));
+    EXPECT_TRUE(m_scenario->isValidatedInSession(otherPath));
+    EXPECT_FALSE(finished(hungPath));
+    EXPECT_FALSE(m_scenario->isValidatedInSession(hungPath));
+
+    // [WHEN] The hung plugin eventually loads
+    released.store(true);
+
+    // [THEN] It completes too
+    ASSERT_TRUE(pumpUntil([&finished, &hungPath]() { return finished(hungPath); }));
+    EXPECT_TRUE(m_scenario->isValidatedInSession(hungPath));
 }
