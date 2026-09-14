@@ -22,6 +22,8 @@
 
 #include "fxresolver.h"
 
+#include <algorithm>
+
 #include "audio/common/audiosanitizer.h"
 
 #include "log.h"
@@ -29,6 +31,15 @@
 using namespace muse::async;
 using namespace muse::audio;
 using namespace muse::audio::fx;
+
+//! The lists come per fx type (one resolver each); the chain's order runs across types, and the
+//! chain node processes the list in order.
+static void sortByChainOrder(std::vector<IFxProcessorPtr>& fxList)
+{
+    std::stable_sort(fxList.begin(), fxList.end(), [](const IFxProcessorPtr& a, const IFxProcessorPtr& b) {
+        return a->params().chainOrder < b->params().chainOrder;
+    });
+}
 
 std::vector<IFxProcessorPtr> FxResolver::resolveMasterFxList(const AudioFxChain& fxChain, const OutputSpec& outputSpec)
 {
@@ -56,6 +67,8 @@ std::vector<IFxProcessorPtr> FxResolver::resolveMasterFxList(const AudioFxChain&
         std::vector<IFxProcessorPtr> fxList = resolver.second->resolveMasterFxList(std::move(fxChainByType), outputSpec);
         result.insert(result.end(), fxList.begin(), fxList.end());
     }
+
+    sortByChainOrder(result);
 
     return result;
 }
@@ -86,6 +99,8 @@ std::vector<IFxProcessorPtr> FxResolver::resolveFxList(const TrackId trackId, co
         std::vector<IFxProcessorPtr> fxList = resolver.second->resolveFxList(trackId, std::move(fxChainByType), outputSpec);
         result.insert(result.end(), fxList.begin(), fxList.end());
     }
+
+    sortByChainOrder(result);
 
     return result;
 }
