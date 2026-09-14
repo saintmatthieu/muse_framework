@@ -25,6 +25,8 @@
 #include "modularity/ioc.h"
 #include "vstpluginprovider.h"
 
+#include "pluginterfaces/vst/ivstmessage.h"
+
 #include "async/async.h"
 
 #include "defer.h"
@@ -48,6 +50,30 @@ static void stateBufferFromString(VstMemoryStream& buffer, char* strData, const 
     buffer.setSize(0);
     buffer.write(strData, static_cast<Steinberg::int32>(strSize), nullptr);
     buffer.seek(0, Steinberg::IBStream::kIBSeekSet, nullptr);
+}
+
+//! Links the component (the processor) and the edit controller through their connection points,
+//! as a host is expected to (see the SDK's PlugProvider::connectComponents). A plugin whose two
+//! halves aren't linked internally (the DPF-based ones, for instance) hands the editor's parameter
+//! edits to the processor over this channel; without it, its editor has no effect on the sound.
+static void connectComponents(VstPluginProvider& provider, bool connect)
+{
+    Steinberg::FUnknownPtr<Steinberg::Vst::IConnectionPoint> componentPoint(provider.component().get());
+    Steinberg::FUnknownPtr<Steinberg::Vst::IConnectionPoint> controllerPoint(provider.controller().get());
+    if (!componentPoint || !controllerPoint) {
+        LOGD() << "no connection points to " << (connect ? "connect" : "disconnect");
+        return;
+    }
+
+    LOGD() << (connect ? "connecting" : "disconnecting") << " the component and the controller";
+
+    if (connect) {
+        componentPoint->connect(controllerPoint);
+        controllerPoint->connect(componentPoint);
+    } else {
+        componentPoint->disconnect(controllerPoint);
+        controllerPoint->disconnect(componentPoint);
+    }
 }
 
 VstPluginInstance::VstPluginInstance(const muse::audio::AudioResourceId& resourceId)
@@ -79,6 +105,10 @@ VstPluginInstance::~VstPluginInstance()
 
     Async::call(nullptr, [resourceId, provider, module, securer, repo]() mutable {
         ONLY_MAIN_THREAD(securer);
+
+        if (provider) {
+            connectComponents(*provider, false);
+        }
 
         repo()->removePluginModule(resourceId);
 
@@ -162,6 +192,7 @@ void VstPluginInstance::load()
         }
 
         controller->setComponentHandler(m_componentHandlerPtr);
+        connectComponents(*m_pluginProvider, true);
         syncControllerToComponentState();
 
         m_isLoaded = true;
@@ -381,6 +412,27 @@ bool VstPluginInstance::isLoaded() const
 Notification VstPluginInstance::loadingCompleted() const
 {
     return m_loadingCompleted;
+}
+
+async::Channel<PluginParamId, PluginParamValue> VstPluginInstance::paramChanged() const
+{
+    return m_componentHandlerPtr->pluginParamChanged();
+}
+
+void VstPluginInstance::setControllerParamNormalized(PluginParamId id, PluginParamValue value)
+{
+    ONLY_MAIN_THREAD(threadSecurer);
+
+    if (!m_isLoaded || !m_pluginProvider) {
+        return;
+    }
+
+    PluginControllerPtr controller = m_pluginProvider->controller();
+    if (!controller) {
+        return;
+    }
+
+    controller->setParamNormalized(id, value);
 }
 
 async::Channel<muse::audio::AudioUnitConfig> VstPluginInstance::pluginSettingsChanged() const

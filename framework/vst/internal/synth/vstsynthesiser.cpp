@@ -75,6 +75,10 @@ void VstSynthesiser::init(const OutputSpec& spec)
         m_pluginPtr->loadingCompleted().onNotify(this, onPluginLoaded);
     }
 
+    m_pluginPtr->paramChanged().onReceive(this, [this](PluginParamId id, PluginParamValue value) {
+        m_vstAudioClient->queueParamChange(ParamChangeEvent { id, value });
+    });
+
     m_pluginPtr->pluginSettingsChanged().onReceive(this, [this](const muse::audio::AudioUnitConfig& newConfig) {
         if (m_params.configuration == newConfig) {
             return;

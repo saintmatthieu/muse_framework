@@ -24,8 +24,13 @@
 #include "../ivstplugininstance.h"
 #include "../vsttypes.h"
 
+#include <mutex>
+#include <unordered_map>
+#include <vector>
+
 #include "modularity/ioc.h"
 #include "audio/engine/itransporteventsdispatcher.h"
+#include "audio/common/iaudiothreadsecurer.h"
 #include "midiremote/immcdecoderfactory.h"
 
 namespace muse::vst {
@@ -33,6 +38,7 @@ class VstAudioClient
 {
     muse::GlobalInject<muse::audio::engine::ITransportEventsDispatcher> transportEventsDispatcher;
     muse::GlobalInject<muse::midiremote::IMMCDecoderFactory> mmcDecoderFactory;
+    muse::GlobalInject<muse::audio::IAudioThreadSecurer> threadSecurer;
 
 public:
     VstAudioClient();
@@ -49,6 +55,8 @@ public:
 
     bool handleEvent(const VstEvent& event);
     bool handleParamChange(const ParamChangeEvent& param);
+    //! Thread-safe: a parameter edited in the plugin's editor (main thread) is applied by the next process call
+    void queueParamChange(const ParamChangeEvent& param);
 
     void flushSound();
 
@@ -75,6 +83,8 @@ private:
     void flushBuffers();
 
     void addParamChange(const ParamChangeEvent& param);
+    void addPendingParamChanges();
+    void forwardOutputParamChanges(muse::audio::samples_t samplesPerChannel);
 
     bool m_isActive = false;
     muse::audio::gain_t m_volumeGain = 1.f; // 0.0 - 1.0
@@ -87,6 +97,11 @@ private:
 
     VstEventList m_inputEvents;
     VstParameterChanges m_inputParamChanges;
+    VstParameterChanges m_outputParamChanges;
+    std::mutex m_pendingParamChangesMutex;
+    std::vector<ParamChangeEvent> m_pendingParamChanges;
+    std::unordered_map<PluginParamId, PluginParamValue> m_outputParamValues;
+    muse::audio::samples_t m_samplesSinceOutputParamsForwarded = 0;
     VstEventList m_outputEvents;
     VstProcessData m_processData;
     VstProcessContext m_processContext;
