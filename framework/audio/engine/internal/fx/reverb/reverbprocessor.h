@@ -54,7 +54,7 @@ public:
 
     void process(float* buffer, samples_t sampleCount, samples_t playbackPositionSamples = 0) override;
 
-private:
+    //! The parameters, for a host that drives them (the defaults are those of an aux-send reverb).
     enum Params
     {
         Quality,
@@ -102,6 +102,7 @@ private:
 
     void setParameter(int32_t index, float newValue);
 
+private:
     bool setFormat(audioch_t audioChannelsCount, double sampleRate, int32_t maximumBlockSize);
 
     void deleteSignalBuffers();
