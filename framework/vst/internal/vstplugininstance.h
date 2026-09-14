@@ -68,6 +68,8 @@ public:
     async::Notification loadingCompleted() const override;
 
     async::Channel<muse::audio::AudioUnitConfig> pluginSettingsChanged() const override;
+    async::Channel<PluginParamId, PluginParamValue> paramChanged() const override;
+    void setControllerParamNormalized(PluginParamId id, PluginParamValue value) override;
 
 private:
     void syncControllerToComponentState();

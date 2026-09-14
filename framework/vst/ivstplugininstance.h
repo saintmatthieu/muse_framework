@@ -48,5 +48,13 @@ public:
     virtual void updatePluginConfig(const muse::audio::AudioUnitConfig& config) = 0;
     virtual void refreshConfig() = 0;
     virtual async::Channel<muse::audio::AudioUnitConfig> pluginSettingsChanged() const = 0;
+
+    //! A parameter edited in the plugin's editor (IComponentHandler::performEdit), to be handed to the
+    //! processor as a parameter change of the next process call; the host's job in VST3.
+    virtual async::Channel<PluginParamId, PluginParamValue> paramChanged() const = 0;
+
+    //! A parameter value the processor reports (an output parameter: a meter, ...), for the editor to show
+    //! (IEditController::setParamNormalized; the host's job in VST3). Main thread.
+    virtual void setControllerParamNormalized(PluginParamId id, PluginParamValue value) = 0;
 };
 }

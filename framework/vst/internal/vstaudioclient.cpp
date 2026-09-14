@@ -21,6 +21,9 @@
  */
 #include "vstaudioclient.h"
 
+#include "async/async.h"
+
+#include <algorithm>
 #include "log.h"
 
 using namespace muse;
@@ -190,6 +193,64 @@ bool VstAudioClient::handleEvent(const VstEvent& event)
     return false;
 }
 
+void VstAudioClient::queueParamChange(const ParamChangeEvent& param)
+{
+    std::lock_guard lock(m_pendingParamChangesMutex);
+    m_pendingParamChanges.push_back(param);
+}
+
+void VstAudioClient::addPendingParamChanges()
+{
+    //! NOTE Audio thread: never block on the main thread; whatever isn't taken now goes with the next call
+    std::unique_lock lock(m_pendingParamChangesMutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        return;
+    }
+
+    for (const ParamChangeEvent& param : m_pendingParamChanges) {
+        addParamChange(param);
+    }
+    m_pendingParamChanges.clear();
+}
+
+//! The values the processor reports through the output parameter queue (meters, ...) go to the editor's
+//! controller on the main thread, the latest value per parameter, some 30 times a second.
+void VstAudioClient::forwardOutputParamChanges(samples_t samplesPerChannel)
+{
+    static constexpr double FORWARDING_RATE_HZ = 30.;
+
+    const Steinberg::int32 count = m_outputParamChanges.getParameterCount();
+    for (Steinberg::int32 i = 0; i < count; ++i) {
+        Steinberg::Vst::IParamValueQueue* queue = m_outputParamChanges.getParameterData(i);
+        if (!queue || queue->getPointCount() <= 0) {
+            continue;
+        }
+
+        Steinberg::int32 sampleOffset = 0;
+        PluginParamValue value = 0.;
+        if (queue->getPoint(queue->getPointCount() - 1, sampleOffset, value) != Steinberg::kResultOk) {
+            continue;
+        }
+
+        m_outputParamValues.insert_or_assign(queue->getParameterId(), value);
+    }
+
+    m_samplesSinceOutputParamsForwarded += samplesPerChannel;
+    const samples_t interval = std::max<samples_t>(1, static_cast<samples_t>(m_outputSpec.sampleRate / FORWARDING_RATE_HZ));
+    if (m_outputParamValues.empty() || m_samplesSinceOutputParamsForwarded < interval) {
+        return;
+    }
+    m_samplesSinceOutputParamsForwarded = 0;
+
+    //! NOTE The instance is kept alive by the copy; the client may be gone by the time this runs
+    async::Async::call(nullptr, [instance = m_pluginPtr, values = std::move(m_outputParamValues)]() {
+        for (const auto& [id, value] : values) {
+            instance->setControllerParamNormalized(id, value);
+        }
+    }, threadSecurer()->mainThreadId());
+    m_outputParamValues.clear();
+}
+
 bool VstAudioClient::handleParamChange(const ParamChangeEvent& param)
 {
     ensureActivity();
@@ -277,6 +338,8 @@ audio::samples_t VstAudioClient::process(float* output, samples_t samplesPerChan
         extractInputSamples(samplesPerChannel, output);
     }
 
+    addPendingParamChanges();
+
     if (processor->process(m_processData) != Steinberg::kResultOk) {
         return 0;
     }
@@ -285,12 +348,13 @@ audio::samples_t VstAudioClient::process(float* output, samples_t samplesPerChan
 
     if (m_type == PluginType::Instrument) {
         m_inputEvents.clear();
-        m_inputParamChanges.clearQueue();
-
         fillOutputBufferInstrument(samplesPerChannel, output);
     } else {
         fillOutputBufferFx(samplesPerChannel, output);
     }
+    m_inputParamChanges.clearQueue();
+    forwardOutputParamChanges(samplesPerChannel);
+    m_outputParamChanges.clearQueue();
 
     processOutputEvents();
 
@@ -353,6 +417,8 @@ void VstAudioClient::setUpProcessData()
     m_processContext.sampleRate = m_outputSpec.sampleRate;
     m_processData.inputEvents = &m_inputEvents;
     m_processData.inputParameterChanges = &m_inputParamChanges;
+    //! NOTE Not read (yet), but a plugin may expect the queue to exist (DPF-based ones assert on it every call)
+    m_processData.outputParameterChanges = &m_outputParamChanges;
     m_processData.outputEvents = &m_outputEvents;
     m_processData.processContext = &m_processContext;
 
