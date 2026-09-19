@@ -351,19 +351,19 @@ void RegisterAudioPluginsScenario::processPluginsRegistration(const io::paths_t&
     std::atomic<int64_t> nextIndex { 0 };
     std::atomic<int64_t> activeWorkers { 0 };
     std::vector<std::thread> workers;
-    PluginResourceIdList completedPlaceholderIds;
+    io::paths_t completedPluginPaths;
     AudioPluginInfoList completedPluginInfo;
     int64_t doneCount = 0;
 
     auto flushCompletedScanResults = [&]() {
-        if (completedPlaceholderIds.empty() && completedPluginInfo.empty()) {
+        if (completedPluginPaths.empty() && completedPluginInfo.empty()) {
             return;
         }
 
-        SCAN_TRACE() << "Flushing audio plugin scan results: placeholders=" << completedPlaceholderIds.size()
+        SCAN_TRACE() << "Flushing audio plugin scan results: placeholders=" << completedPluginPaths.size()
                      << ", pluginInfos=" << completedPluginInfo.size();
 
-        Ret ret = knownPluginsRegister()->unregisterPlugins(completedPlaceholderIds);
+        Ret ret = knownPluginsRegister()->removePluginsAtPaths(completedPluginPaths);
         if (!ret) {
             LOGE() << "Failed to remove completed plugin placeholders: " << ret.toString();
         }
@@ -373,7 +373,7 @@ void RegisterAudioPluginsScenario::processPluginsRegistration(const io::paths_t&
             LOGE() << "Failed to register scanned plugins: " << ret.toString();
         }
 
-        completedPlaceholderIds.clear();
+        completedPluginPaths.clear();
         completedPluginInfo.clear();
     };
 
@@ -465,13 +465,13 @@ void RegisterAudioPluginsScenario::processPluginsRegistration(const io::paths_t&
             continue;
         }
 
-        completedPlaceholderIds.push_back(placeholderIdFromPath(pluginPaths[scan.index]));
+        completedPluginPaths.push_back(pluginPaths[scan.index]);
         appendPluginInfos(completedPluginInfo, scanResult(pluginPaths[scan.index], scan.resultFile, scan.code));
 
         m_progress.progress(doneCount, pluginCount, io::filename(pluginPaths[scan.index]).toStdString());
         processProgressEvents();
 
-        if (completedPlaceholderIds.size() >= registryFlushSize) {
+        if (completedPluginPaths.size() >= registryFlushSize) {
             flushCompletedScanResults();
         }
 

@@ -21,6 +21,8 @@
  */
 #include <gmock/gmock.h>
 
+#include <algorithm>
+
 #include "audioplugins/internal/registeraudiopluginsscenario.h"
 #include "audioplugins/audiopluginserrors.h"
 
@@ -44,6 +46,7 @@ using ::testing::ElementsAre;
 using ::testing::NiceMock;
 using ::testing::Return;
 using ::testing::ReturnRef;
+using ::testing::UnorderedElementsAreArray;
 
 using namespace muse;
 using namespace muse::audioplugins;
@@ -103,6 +106,9 @@ protected:
         .WillByDefault(Return(muse::make_ok()));
 
         ON_CALL(*m_knownPlugins, removePluginsAtPath(_))
+        .WillByDefault(Return(muse::make_ok()));
+
+        ON_CALL(*m_knownPlugins, removePluginsAtPaths(_))
         .WillByDefault(Return(muse::make_ok()));
 
         ON_CALL(*m_knownPlugins, registerPlugins(_))
@@ -214,10 +220,12 @@ TEST_F(AudioPlugins_RegisterAudioPluginsScenarioTest, UpdatePluginsRegistry)
         }
     }
 
-    // [THEN] Completed Discovered placeholders are removed in one batch before
-    // scanned results are registered.
-    EXPECT_CALL(*m_knownPlugins, unregisterPlugins(_))
+    // [THEN] Completed Discovered placeholders are removed by path, in one
+    // batch, before scanned results are registered.
+    EXPECT_CALL(*m_knownPlugins, removePluginsAtPaths(_))
     .WillOnce(Return(make_ok()));
+    EXPECT_CALL(*m_knownPlugins, unregisterPlugins(_))
+    .Times(0);
 
     // [THEN] The register is refreshed
     EXPECT_CALL(*m_knownPlugins, load())
@@ -229,6 +237,100 @@ TEST_F(AudioPlugins_RegisterAudioPluginsScenarioTest, UpdatePluginsRegistry)
 
     // [THEN] Plugins successfully registered
     EXPECT_TRUE(ret);
+}
+
+TEST_F(AudioPlugins_RegisterAudioPluginsScenarioTest, UpdatePluginsRegistry_DuplicateInstallIsValidatedOnlyOnce)
+{
+    // [GIVEN] The same plugin installed at two paths -- so both carry the same
+    // plugin id. One is already validated, the other is new.
+    const path_t registeredPath = "/Library/VST3/Dup.vst3";
+    const path_t newPath = "/Library/VST3/copy/Dup.vst3";
+
+    AudioPluginInfo registered;
+    registered.meta.id = "Dup";
+    registered.meta.type = "VstPlugin";
+    registered.path = registeredPath;
+    registered.state = AudioPluginState::Validated;
+
+    // [GIVEN] A stand-in for the on-disk cache, so that the second
+    // updatePluginsRegistry() sees what the first one persisted.
+    AudioPluginInfoList cache { registered };
+
+    ON_CALL(*m_knownPlugins, pluginInfoList(_))
+    .WillByDefault([&cache](IKnownAudioPluginsRegister::PluginInfoAccepted) {
+        return cache;
+    });
+
+    ON_CALL(*m_knownPlugins, registerPlugins(_))
+    .WillByDefault([&cache](const AudioPluginInfoList& list) {
+        cache.insert(cache.end(), list.cbegin(), list.cend());
+        return make_ok();
+    });
+
+    auto eraseAtPaths = [&cache](const paths_t& paths) {
+        cache.erase(std::remove_if(cache.begin(), cache.end(), [&paths](const AudioPluginInfo& info) {
+            return std::find(paths.cbegin(), paths.cend(), info.path) != paths.cend();
+        }), cache.end());
+        return make_ok();
+    };
+
+    ON_CALL(*m_knownPlugins, removePluginsAtPaths(_))
+    .WillByDefault(eraseAtPaths);
+
+    ON_CALL(*m_knownPlugins, removePluginsAtPath(_))
+    .WillByDefault([eraseAtPaths](const path_t& path) {
+        return eraseAtPaths(paths_t { path });
+    });
+
+    ON_CALL(*m_knownPlugins, unregisterPlugins(_))
+    .WillByDefault([&cache](const PluginResourceIdList& ids) {
+        cache.erase(std::remove_if(cache.begin(), cache.end(), [&ids](const AudioPluginInfo& info) {
+            return std::find(ids.cbegin(), ids.cend(), info.meta.id) != ids.cend();
+        }), cache.end());
+        return make_ok();
+    });
+
+    ON_CALL(*m_knownPlugins, load())
+    .WillByDefault(Return(make_ok()));
+
+    // [GIVEN] The scanner reports both installs
+    for (const IAudioPluginsScannerPtr& scanner : m_scanners) {
+        AudioPluginsScannerMock* mock = dynamic_cast<AudioPluginsScannerMock*>(scanner.get());
+        ASSERT_TRUE(mock);
+
+        ON_CALL(*mock, scanPlugins(_))
+        .WillByDefault(Return(paths_t { registeredPath, newPath }));
+    }
+
+    // [GIVEN] The validator reports the shared id for the new path
+    AudioPluginInfo scanned = registered;
+    scanned.path = newPath;
+
+    ON_CALL(*m_knownPlugins, readPluginsFrom(_))
+    .WillByDefault(Return(RetVal<AudioPluginInfoList>::make_ok({ scanned })));
+
+    // [THEN] Only the new path is validated, and only on the first run: removing
+    // its placeholder must not evict the twin at the other path, which would
+    // make that one look new next time and re-validate both forever.
+    EXPECT_CALL(*m_process, execute(m_appPath,
+                                    ElementsAre("--register-audio-plugin", newPath.toStdString(),
+                                                "--register-audio-plugin-out", _), _, _))
+    .WillOnce(Return(0));
+
+    EXPECT_CALL(*m_process, execute(m_appPath,
+                                    ElementsAre("--register-audio-plugin", registeredPath.toStdString(),
+                                                "--register-audio-plugin-out", _), _, _))
+    .Times(0);
+
+    EXPECT_CALL(*m_interactive, showProgress(_, _))
+    .Times(1);
+
+    // [WHEN] Two consecutive launches scan the same folders
+    EXPECT_TRUE(m_scenario->updatePluginsRegistry());
+    EXPECT_TRUE(m_scenario->updatePluginsRegistry());
+
+    // [THEN] Both installs are known; neither evicted the other
+    EXPECT_EQ(cache.size(), 2u);
 }
 
 TEST_F(AudioPlugins_RegisterAudioPluginsScenarioTest, UpdatePluginsRegistry_NoNewPlugins)
@@ -777,6 +879,8 @@ TEST_F(AudioPlugins_RegisterAudioPluginsScenarioTest, CanceledValidationDoesNotR
     .WillOnce(Return(make_ok()));
     EXPECT_CALL(*m_knownPlugins, unregisterPlugins(_))
     .Times(0);
+    EXPECT_CALL(*m_knownPlugins, removePluginsAtPaths(_))
+    .Times(0);
     EXPECT_CALL(*m_knownPlugins, readPluginsFrom(_))
     .Times(0);
 
@@ -838,13 +942,16 @@ TEST_F(AudioPlugins_RegisterAudioPluginsScenarioTest, RegisterNewPlugins_MainApp
     };
 
     // [THEN] One removePluginsAtPath per path; completed placeholders are
-    // removed in one unregisterPlugins batch.
+    // removed in one removePluginsAtPaths batch, holding every scanned path.
     EXPECT_CALL(*m_knownPlugins, removePluginsAtPath(_))
     .Times(3)
     .WillRepeatedly(Return(make_ok()));
 
-    EXPECT_CALL(*m_knownPlugins, unregisterPlugins(_))
+    EXPECT_CALL(*m_knownPlugins, removePluginsAtPaths(UnorderedElementsAreArray(paths)))
     .WillOnce(Return(make_ok()));
+
+    EXPECT_CALL(*m_knownPlugins, unregisterPlugins(_))
+    .Times(0);
 
     // [THEN] registerPlugins is called once for the placeholder batch plus once
     // for the collected subprocess results.

@@ -353,13 +353,24 @@ Ret KnownAudioPluginsRegister::unregisterPlugins(const PluginResourceIdList& res
 
 Ret KnownAudioPluginsRegister::removePluginsAtPath(const io::path_t& path)
 {
+    return removePluginsAtPaths({ path });
+}
+
+Ret KnownAudioPluginsRegister::removePluginsAtPaths(const io::paths_t& paths)
+{
     IF_ASSERT_FAILED(m_loaded) {
         return false;
     }
 
+    if (paths.empty()) {
+        return make_ok();
+    }
+
+    const std::set<io::path_t> pathsToRemove(paths.cbegin(), paths.cend());
+
     bool removed = false;
     for (auto it = m_pluginInfoMap.begin(); it != m_pluginInfoMap.end();) {
-        if (it->second.path == path) {
+        if (muse::contains(pathsToRemove, it->second.path)) {
             it = m_pluginInfoMap.erase(it);
             removed = true;
         } else {
@@ -371,7 +382,9 @@ Ret KnownAudioPluginsRegister::removePluginsAtPath(const io::path_t& path)
         return make_ok();
     }
 
-    muse::remove(m_pluginPaths, path);
+    for (const io::path_t& path : pathsToRemove) {
+        muse::remove(m_pluginPaths, path);
+    }
 
     return writePluginsInfo();
 }
