@@ -42,8 +42,12 @@ class RegisterAudioPluginsScenario : public IRegisterAudioPluginsScenario, publi
 {
 public:
     GlobalInject<IGlobalConfiguration> globalConfiguration;
-    GlobalInject<IProcess> process;
-    GlobalInject<io::IFileSystem> fileSystem;
+    //! NOTE Resolved from the scan worker threads (see scanPlugins), so they
+    //! must be thread-safe: a plain Inject resolves (and subscribes to the IoC)
+    //! lazily and without a lock, which races and leaves stale subscriptions
+    //! behind, called on freed memory when the IoC is reset at shutdown.
+    GlobalThreadSafeInject<IProcess> process;
+    GlobalThreadSafeInject<io::IFileSystem> fileSystem;
     GlobalInject<IKnownAudioPluginsRegister> knownPluginsRegister;
     GlobalInject<IAudioPluginsScannerRegister> scannerRegister;
     GlobalInject<IAudioPluginMetaReaderRegister> metaReaderRegister;
