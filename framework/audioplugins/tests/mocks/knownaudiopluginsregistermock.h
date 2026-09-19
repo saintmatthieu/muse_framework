@@ -46,6 +46,7 @@ public:
     MOCK_METHOD(Ret, setPluginsState, (const io::paths_t&, AudioPluginState), (override));
 
     MOCK_METHOD(Ret, removePluginsAtPath, (const io::path_t&), (override));
+    MOCK_METHOD(Ret, removePluginsAtPaths, (const io::paths_t&), (override));
 
     MOCK_METHOD(Ret, writePluginsTo, (const io::path_t&, const AudioPluginInfoList&), (const, override));
     MOCK_METHOD(RetVal<AudioPluginInfoList>, readPluginsFrom, (const io::path_t&), (const, override));

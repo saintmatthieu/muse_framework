@@ -330,6 +330,75 @@ TEST_F(AudioPlugins_KnownAudioPluginsRegisterTest, RegisterPlugins_SameIdDiffere
     EXPECT_EQ(m_knownPlugins->pluginInfoList().size(), 2u);
 }
 
+TEST_F(AudioPlugins_KnownAudioPluginsRegisterTest, RemovePluginsAtPaths_LeavesSameIdAtOtherPath)
+{
+    // Removal is keyed by path, not by id: the same plugin installed twice
+    // shares an id, and evicting the sibling would make it look new to the next
+    // scan, which would evict this one back -- validating both on every launch.
+    ON_CALL(*m_fileSystem, writeFile(_, _))
+    .WillByDefault(Return(muse::make_ok()));
+
+    ASSERT_TRUE(m_knownPlugins->load());
+
+    AudioPluginInfo a;
+    a.meta.id = "Dup";
+    a.meta.type = "VstPlugin";
+    a.path = "/path/A/Dup.vst3";
+    a.state = AudioPluginState::Validated;
+
+    AudioPluginInfo b = a;
+    b.path = "/path/B/Dup.vst3";
+
+    ASSERT_TRUE(m_knownPlugins->registerPlugins({ a, b }));
+    ASSERT_EQ(m_knownPlugins->pluginInfoList().size(), 2u);
+
+    ASSERT_TRUE(m_knownPlugins->removePluginsAtPaths({ b.path }));
+
+    const AudioPluginInfoList remaining = m_knownPlugins->pluginInfoList();
+    ASSERT_EQ(remaining.size(), 1u);
+    EXPECT_EQ(remaining.front().path, a.path);
+    EXPECT_TRUE(m_knownPlugins->exists(a.path));
+    EXPECT_FALSE(m_knownPlugins->exists(b.path));
+}
+
+TEST_F(AudioPlugins_KnownAudioPluginsRegisterTest, RemovePluginsAtPaths_WritesOnceForTheWholeBatch)
+{
+    ASSERT_TRUE(m_knownPlugins->load());
+
+    AudioPluginInfoList infos;
+    for (const char* name : { "AAA", "BBB", "CCC" }) {
+        AudioPluginInfo info;
+        info.meta.id = name;
+        info.meta.type = "VstPlugin";
+        info.path = "/some/path/" + std::string(name) + ".vst3";
+        info.state = AudioPluginState::Validated;
+        infos.push_back(info);
+    }
+
+    // one write for registerPlugins, one for the whole removal batch
+    EXPECT_CALL(*m_fileSystem, writeFile(m_knownAudioPluginsFilePath, _))
+    .Times(2)
+    .WillRepeatedly(Return(muse::make_ok()));
+
+    ASSERT_TRUE(m_knownPlugins->registerPlugins(infos));
+    ASSERT_TRUE(m_knownPlugins->removePluginsAtPaths({ infos[0].path, infos[2].path }));
+
+    const AudioPluginInfoList remaining = m_knownPlugins->pluginInfoList();
+    ASSERT_EQ(remaining.size(), 1u);
+    EXPECT_EQ(remaining.front().meta.id, "BBB");
+}
+
+TEST_F(AudioPlugins_KnownAudioPluginsRegisterTest, RemovePluginsAtPaths_UnknownPathsDoNotWrite)
+{
+    ASSERT_TRUE(m_knownPlugins->load());
+
+    EXPECT_CALL(*m_fileSystem, writeFile(_, _))
+    .Times(0);
+
+    EXPECT_TRUE(m_knownPlugins->removePluginsAtPaths({ "/not/known/XXX.vst3" }));
+    EXPECT_TRUE(m_knownPlugins->removePluginsAtPaths({}));
+}
+
 TEST_F(AudioPlugins_KnownAudioPluginsRegisterTest, SetPluginsState_MarksEveryEntryUnderPath)
 {
     // State changes are keyed by path: a vanished binary flips every id it

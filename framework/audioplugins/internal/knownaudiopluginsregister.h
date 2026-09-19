@@ -61,6 +61,7 @@ public:
     Ret setPluginsState(const io::paths_t& paths, AudioPluginState state) override;
 
     Ret removePluginsAtPath(const io::path_t& path) override;
+    Ret removePluginsAtPaths(const io::paths_t& paths) override;
 
     Ret writePluginsTo(const io::path_t& file, const AudioPluginInfoList& list) const override;
     RetVal<AudioPluginInfoList> readPluginsFrom(const io::path_t& file) const override;
