@@ -118,6 +118,7 @@ Item {
             rightMargin: showVerticalHeader ? 8 : index === tableView.model.columnCount() - 1 ? 16 : 8
 
             title: display.title
+            alignment: display.alignment
             preferredWidth: display.preferredWidth
             availableFormats: display.availableFormats
 
@@ -260,6 +261,7 @@ Item {
             cellType: hHeaderData.cellType
             cellEditMode: hHeaderData.cellEditMode
             preferredWidth: hHeaderData.preferredWidth
+            alignment: hHeaderData.alignment
 
             sourceComponentCallback: root.sourceComponentCallback
             displayTruncatedTextOnHover: root.displayTruncatedTextOnHover

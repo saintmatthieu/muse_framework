@@ -73,6 +73,8 @@ class TableViewHeader : public QObject
     Q_PROPERTY(muse::uicomponents::TableViewCellEditMode::Mode cellEditMode READ cellEditMode NOTIFY cellEditModeChanged FINAL)
 
     Q_PROPERTY(int preferredWidth READ preferredWidth WRITE setPreferredWidth NOTIFY preferredWidthChanged FINAL)
+    //! NOTE Of the column's title and cells, e.g. Qt::AlignHCenter
+    Q_PROPERTY(int alignment READ alignment WRITE setAlignment NOTIFY alignmentChanged FINAL)
 
     Q_PROPERTY(
         muse::uicomponents::MenuItemList availableFormats READ availableFormats WRITE setAvailableFormats NOTIFY availableFormatsChanged FINAL)
@@ -86,6 +88,9 @@ public:
 
     int preferredWidth() const;
     void setPreferredWidth(int width);
+
+    int alignment() const;
+    void setAlignment(int alignment);
 
     TableViewCellType::Type cellType() const;
     void setCellType(TableViewCellType::Type type);
@@ -106,6 +111,7 @@ signals:
     void cellEditModeChanged();
 
     void preferredWidthChanged();
+    void alignmentChanged();
 
     void availableFormatsChanged();
     void currentFormatIdChanged();
@@ -119,6 +125,7 @@ private:
     TableViewCellEditMode::Mode m_cellEditMode = TableViewCellEditMode::Mode::StartInEdit;
 
     int m_preferredWidth = 0;
+    int m_alignment = Qt::AlignLeft;
 
     MenuItemList m_availableFormats;
     QString m_currentFormatId;

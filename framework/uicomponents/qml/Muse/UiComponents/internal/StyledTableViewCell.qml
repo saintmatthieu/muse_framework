@@ -34,6 +34,7 @@ TableViewDelegate {
     property int cellType: TableViewCellType.Undefined
     property int cellEditMode: TableViewCellEditMode.StartInEdit
     property int preferredWidth: 0
+    property int alignment: Qt.AlignLeft
 
     property var sourceComponentCallback
 
@@ -53,10 +54,15 @@ TableViewDelegate {
     implicitHeight: 44
     implicitWidth: Math.max(valueLoader.itemImplicitWidth, preferredWidth)
 
-    leftPadding: 0
-    rightPadding: 0
-    topPadding: 0
-    bottomPadding: 0
+    // A centred value keeps its own size, in the middle of the cell
+    readonly property bool isCentered: alignment === Qt.AlignHCenter
+    readonly property real centeredHorizontalPadding: valueLoader.item ? Math.max(0, (width - valueLoader.item.implicitWidth) / 2) : 0
+    readonly property real centeredVerticalPadding: valueLoader.item ? Math.max(0, (height - valueLoader.item.implicitHeight) / 2) : 0
+
+    leftPadding: isCentered ? centeredHorizontalPadding : 0
+    rightPadding: isCentered ? centeredHorizontalPadding : 0
+    topPadding: isCentered ? centeredVerticalPadding : 0
+    bottomPadding: isCentered ? centeredVerticalPadding : 0
 
     onPressedChanged: {
         prv.onCellPressedChanged(pressed)
@@ -127,7 +133,8 @@ TableViewDelegate {
 
         property int itemImplicitWidth: Boolean(item) ? anchors.leftMargin + item.implicitWidth + anchors.rightMargin : 0
 
-        anchors.fill: parent
+        // Else placed by the paddings
+        anchors.fill: root.isCentered ? undefined : parent
         anchors.leftMargin: evenMargins ? 8 : column === 0 ? 16 : 8
         anchors.rightMargin: evenMargins ? 8 : column === tableView.model.columnCount() - 1 ? 16 : 8
         anchors.topMargin: 8

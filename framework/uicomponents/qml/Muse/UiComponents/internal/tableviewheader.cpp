@@ -58,6 +58,21 @@ void TableViewHeader::setPreferredWidth(int width)
     emit preferredWidthChanged();
 }
 
+int TableViewHeader::alignment() const
+{
+    return m_alignment;
+}
+
+void TableViewHeader::setAlignment(int alignment)
+{
+    if (m_alignment == alignment) {
+        return;
+    }
+
+    m_alignment = alignment;
+    emit alignmentChanged();
+}
+
 TableViewCellType::Type TableViewHeader::cellType() const
 {
     return m_cellType;

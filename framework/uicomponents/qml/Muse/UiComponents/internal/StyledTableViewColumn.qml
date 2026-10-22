@@ -29,6 +29,7 @@ Item {
     id: root
 
     property string title: ""
+    property int alignment: Qt.AlignLeft
     property int preferredWidth: 0
 
     property var availableFormats: null
@@ -80,9 +81,13 @@ Item {
     RowLayout {
         id: row
 
+        // Even margins when centred, so that the title is centred on the column
+        readonly property real evenMargin: Math.max(root.leftMargin, root.rightMargin)
+        readonly property bool centered: root.alignment === Qt.AlignHCenter
+
         anchors.fill: parent
-        anchors.leftMargin: root.leftMargin
-        anchors.rightMargin: root.rightMargin
+        anchors.leftMargin: centered ? evenMargin : root.leftMargin
+        anchors.rightMargin: centered ? evenMargin : root.rightMargin
 
         spacing: 4
 
@@ -93,7 +98,7 @@ Item {
             Layout.alignment: Qt.AlignVCenter
 
             text: title
-            horizontalAlignment: Text.AlignLeft
+            horizontalAlignment: root.alignment
             font.capitalization: root.headerCapitalization
             opacity: ui.theme.buttonOpacityNormal
         }
