@@ -37,6 +37,7 @@ class ScriptApi : public QObject, public Contextable
     Q_PROPERTY(QJSValue autobot READ autobot CONSTANT) // deprecated
     Q_PROPERTY(QJSValue testflow READ testflow CONSTANT)
     Q_PROPERTY(QJSValue dispatcher READ dispatcher CONSTANT)
+    Q_PROPERTY(QJSValue commands READ commands CONSTANT)
     Q_PROPERTY(QJSValue navigation READ navigation CONSTANT)
     Q_PROPERTY(QJSValue context READ context CONSTANT)
     Q_PROPERTY(QJSValue shortcuts READ shortcuts CONSTANT)
@@ -56,6 +57,7 @@ public:
     QJSValue testflow() const { return api("MuseInternal.Testflow"); }
     QJSValue autobot() const { return api("MuseInternal.Testflow"); } // deprecated
     QJSValue dispatcher() const { return api("MuseInternal.Dispatcher"); }
+    QJSValue commands() const { return api("MuseInternal.Commands"); }
     QJSValue navigation() const { return api("MuseInternal.Navigation"); }
     QJSValue context() const { return api("MuseInternal.TestflowContext"); }
     QJSValue shortcuts() const { return api("MuseInternal.Shortcuts"); }

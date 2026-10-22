@@ -29,6 +29,7 @@ public:
 
     void registerExports() override;
     void resolveImports() override;
+    void registerApi() override;
 
     modularity::IContextSetup* newContext(const muse::modularity::ContextPtr& ctx) const override;
 };
