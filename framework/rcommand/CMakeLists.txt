@@ -29,6 +29,9 @@ target_sources(muse_rcommand PRIVATE
     commandtypes.h
     actiontocommand.h
 
+    api/commandsapi.cpp
+    api/commandsapi.h
+
     internal/commanddispatcher.cpp
     internal/commanddispatcher.h
     internal/commandsregister.cpp

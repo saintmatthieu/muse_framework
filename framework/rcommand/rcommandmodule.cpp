@@ -19,7 +19,10 @@
 
 #include "rcommandmodule.h"
 
+#include "global/api/iapiregister.h"
 #include "interactive/iinteractiveuriregister.h"
+
+#include "api/commandsapi.h"
 
 #include "internal/commandsregister.h"
 #include "internal/commandsstate.h"
@@ -45,6 +48,16 @@ void RCommandModule::resolveImports()
     auto ir = globalIoc()->resolve<muse::interactive::IInteractiveUriRegister>(mname);
     if (ir) {
         ir->registerQmlUri(Uri("muse://diagnostics/rcommand/list"), "Muse.RCommand", "CommandListDialog");
+    }
+}
+
+void RCommandModule::registerApi()
+{
+    using namespace muse::api;
+
+    auto api = globalIoc()->resolve<IApiRegister>(mname);
+    if (api) {
+        api->regApiCreator(mname, "MuseInternal.Commands", new ApiCreator<rcommand::api::CommandsApi>());
     }
 }
 
