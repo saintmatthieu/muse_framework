@@ -48,11 +48,14 @@ public:
     static void setMode(Mode m);
     static Mode desiredMode();
 
+    static void setSessionMode(Mode m);
+
 private:
 
     static Mode defaultMode();
 
     static Mode m_mode;
     static Mode m_desiredMode;
+    static Mode m_sessionMode;
 };
 }

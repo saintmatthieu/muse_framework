@@ -33,11 +33,18 @@ using namespace muse::audio;
 
 workmode::Mode workmode::m_mode = workmode::Mode::Undefined;
 workmode::Mode workmode::m_desiredMode = workmode::Mode::Undefined;
+workmode::Mode workmode::m_sessionMode = workmode::Mode::Undefined;
 
 static const Settings::Key WORKMODE_KEY("audio", "dev/workmode");
 
 void workmode::load()
 {
+    if (m_sessionMode != Mode::Undefined) {
+        m_mode = m_sessionMode;
+        m_desiredMode = m_mode;
+        return;
+    }
+
     int val = settings()->value(WORKMODE_KEY).toInt();
     if (val > 0 && val <= 3) {
         m_mode = static_cast<Mode>(val);
@@ -68,6 +75,11 @@ void workmode::setMode(Mode m)
     //! NOTE Need restart
     settings()->setLocalValue(WORKMODE_KEY, Val(static_cast<int>(m)));
     m_desiredMode = m;
+}
+
+void workmode::setSessionMode(Mode m)
+{
+    m_sessionMode = m;
 }
 
 workmode::Mode workmode::desiredMode()
