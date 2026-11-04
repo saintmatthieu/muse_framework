@@ -84,7 +84,7 @@ Interactive::Interactive(const muse::modularity::ContextPtr& ctx)
     });
 
     connect(qApp, &QGuiApplication::focusObjectChanged, this, [this](QObject* obj) {
-        auto widget = dynamic_cast<QWidget*>(obj);
+        auto widget = qobject_cast<QWidget*>(obj);
 
         if (widget && widget->isWindow()) {
             raiseWindowInStack(widget);
