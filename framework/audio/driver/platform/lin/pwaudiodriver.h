@@ -26,6 +26,7 @@
 #include "async/asyncable.h"
 
 #include "iaudiodriver.h"
+#include "iaudiooutputmonitor.h"
 
 #include "audiodeviceslistener.h"
 
@@ -36,8 +37,9 @@ struct pw_core;
 namespace muse::audio {
 class PwRegistry;
 class PwStream;
+struct PwMonitor;
 
-class PwAudioDriver : public IAudioDriver, public async::Asyncable
+class PwAudioDriver : public IAudioDriver, public IAudioOutputMonitor, public async::Asyncable
 {
 public:
     PwAudioDriver();
@@ -66,6 +68,14 @@ public:
     std::vector<samples_t> availableOutputDeviceBufferSizes() const override;
     std::vector<sample_rate_t> availableOutputDeviceSampleRates() const override;
 
+    // IAudioOutputMonitor: a level is the quantum asked for (node.latency)
+    Window takeWindow() override;
+    double periodMs() const override;
+    std::vector<double> marginLevelsMs() const override;
+    size_t marginLevel() const override;
+    void setMarginLevel(size_t level) override;
+    void delayNextCallback(double ms) override;
+
 private:
 
     Spec m_formatSpec;
@@ -76,6 +86,7 @@ private:
     pw_core* m_core = nullptr;
 
     std::unique_ptr<PwRegistry> m_registry;
+    std::unique_ptr<PwMonitor> m_monitor;
     std::unique_ptr<PwStream> m_stream;
 };
 }

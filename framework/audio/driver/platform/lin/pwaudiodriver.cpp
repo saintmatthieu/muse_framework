@@ -48,7 +48,11 @@
 #include <spa/support/log.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cmath>
+#include <limits>
+#include <thread>
 #include <condition_variable>
 #include <mutex>
 #include <sstream>
@@ -382,10 +386,81 @@ void PwRegistry::devicesDirty()
 }
 
 namespace muse::audio {
+//! NOTE The output monitor (IAudioOutputMonitor). A level is the quantum asked for (node.latency):
+//! the graph's cycle, which is also what is kept queued for the device, since a stream that doesn't
+//! process in PipeWire's realtime thread (as this one) fills a buffer for the next cycle. The engine's
+//! block stays the spec's, the least level: a callback asking for more renders it all at once
+struct PwMonitor {
+    std::atomic<size_t> requestedLevel { std::numeric_limits<size_t>::max() }; // the last, until chosen
+    std::atomic<double> delayMs { 0.0 };
+    std::atomic<double> periodMs { 0.0 };
+    //! NOTE Set when the level changes: the graph's change of quantum starves the stream for a cycle
+    //! or so, which is no underrun of the app's (and happens while nothing sounds)
+    std::atomic<bool> restartCounting { false };
+
+    mutable std::mutex levelsMutex;
+    std::vector<uint32_t> levelFrames; // under levelsMutex
+    double rate = 0.0; // under levelsMutex
+
+    //! NOTE What the windows are made of: gathered on the "pw-loop" thread, handed over when the lock
+    //! is free (the stream's thread never waits for it)
+    struct Gathered {
+        uint32_t callbacks = 0;
+        uint32_t underruns = 0;
+        double headroomSumMs = 0.0;
+        double headroomMinMs = std::numeric_limits<double>::infinity();
+        double loadSum = 0.0;
+        double loadMax = 0.0;
+        double latencySumMs = 0.0;
+        uint32_t latencyCount = 0;
+        float peak = 0.0f;
+
+        void add(const Gathered& o)
+        {
+            callbacks += o.callbacks;
+            underruns += o.underruns;
+            headroomSumMs += o.headroomSumMs;
+            headroomMinMs = std::min(headroomMinMs, o.headroomMinMs);
+            loadSum += o.loadSum;
+            loadMax = std::max(loadMax, o.loadMax);
+            latencySumMs += o.latencySumMs;
+            latencyCount += o.latencyCount;
+            peak = std::max(peak, o.peak);
+        }
+    };
+    Gathered gathering; // "pw-loop" thread
+    std::mutex windowMutex;
+    Gathered gathered; // under windowMutex
+    double lastLatencyMs = 0.0; // under windowMutex
+
+    //! NOTE "pw-loop" thread, reset at each opening
+    uint64_t callbacksSinceStart = 0;
+    uint64_t framesQueued = 0;
+    int64_t lastStarved = 0;
+    int64_t lastNow = 0;
+
+    void restart()
+    {
+        callbacksSinceStart = 0;
+        framesQueued = 0;
+        lastStarved = 0;
+        lastNow = 0;
+    }
+
+    uint32_t levelFramesFor(size_t level) const
+    {
+        std::scoped_lock lock { levelsMutex };
+        return levelFrames.empty() ? 0 : levelFrames[std::min(level, levelFrames.size() - 1)];
+    }
+
+    void observe(const pw_time& time, int64_t start, int64_t end, uint32_t frames, float peak);
+};
+
 class PwStream
 {
 public:
-    PwStream(pw_core* core, const IAudioDriver::Spec& spec, const std::string& deviceId);
+    PwStream(pw_core* core, const IAudioDriver::Spec& spec, const std::string& deviceId, uint32_t latencyFrames,
+             PwMonitor* monitor);
     ~PwStream();
 
     IAudioDriver::Spec spec() const
@@ -395,6 +470,10 @@ public:
 
     void suspend();
     void resume();
+
+    //! NOTE The quantum asked for, on the stream as it runs: the graph's quantum comes down to the
+    //! least asked, and goes back up once no one asks for less
+    void setLatency(uint32_t frames);
 
 private:
 
@@ -410,14 +489,17 @@ private:
 
     IAudioDriver::Spec m_spec;
     size_t m_stride;
+    PwMonitor* m_monitor = nullptr;
 };
 }
 
 // Called from main thread
-PwStream::PwStream(pw_core* core, const IAudioDriver::Spec& spec, const std::string& deviceId)
+PwStream::PwStream(pw_core* core, const IAudioDriver::Spec& spec, const std::string& deviceId, uint32_t latencyFrames,
+                   PwMonitor* monitor)
     : m_core{core}
     , m_events{}
     , m_spec{spec}
+    , m_monitor{monitor}
 {
     m_events.version = PW_VERSION_STREAM_EVENTS;
     m_events.process = c_process;
@@ -440,8 +522,9 @@ PwStream::PwStream(pw_core* core, const IAudioDriver::Spec& spec, const std::str
     // Note: user system configuration can override this. e.g.:
     //  - PIPEWIRE_QUANTUM or PIPEWIRE_LATENCY environment variable.
     //  - "clock.force-quantum" setting
+    // The margin's level, if more than the block
     std::ostringstream lat;
-    lat << m_spec.output.samplesPerChannel << "/" << m_spec.output.sampleRate;
+    lat << std::max<uint32_t>(latencyFrames, m_spec.output.samplesPerChannel) << "/" << m_spec.output.sampleRate;
     pw_properties_set(props, PW_KEY_NODE_LATENCY, lat.str().c_str());
 
     if (deviceId != PW_DEFAULT_DEVICE) {
@@ -478,6 +561,18 @@ PwStream::~PwStream()
     pw_stream_destroy(m_stream);
 }
 
+// Called from main thread, with the loop locked
+void PwStream::setLatency(uint32_t frames)
+{
+    std::ostringstream lat;
+    lat << std::max<uint32_t>(frames, m_spec.output.samplesPerChannel) << "/" << m_spec.output.sampleRate;
+    const std::string value = lat.str();
+    const spa_dict_item item = SPA_DICT_ITEM_INIT(PW_KEY_NODE_LATENCY, value.c_str());
+    const spa_dict dict = SPA_DICT_INIT(&item, 1);
+    pw_stream_update_properties(m_stream, &dict);
+    LOGI() << "node.latency: " << value;
+}
+
 // Called from main thread
 void PwStream::suspend()
 {
@@ -498,6 +593,15 @@ void PwStream::c_process(void* userdata)
 
 void PwStream::process()
 {
+    // Testing the detection: as if called late
+    if (const double delayMs = m_monitor ? m_monitor->delayMs.exchange(0.0) : 0.0; delayMs > 0.0) {
+        std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>(delayMs * 1000.0)));
+    }
+
+    const int64_t start = pw_stream_get_nsec(m_stream);
+    pw_time time {};
+    pw_stream_get_time_n(m_stream, &time, sizeof(time));
+
     auto b = pw_stream_dequeue_buffer(m_stream);
     if (!b || !b->buffer) {
         LOG_AUDIO() << "out of buffers";
@@ -516,14 +620,93 @@ void PwStream::process()
 
     m_spec.callback(dst, len);
 
+    // The loudest sample (MuseScore writes floats)
+    float peak = 0.0f;
+    const float* samples = reinterpret_cast<const float*>(dst);
+    for (size_t i = 0; i < numFrames * m_spec.output.audioChannelCount; ++i) {
+        peak = std::max(peak, std::abs(samples[i]));
+    }
+
     buf->datas[0].chunk->offset = 0;
     buf->datas[0].chunk->stride = m_stride;
     buf->datas[0].chunk->size = len;
+    // In frames: the stream sums them in its time info (pw_time::queued)
+    b->size = numFrames;
 
     pw_stream_queue_buffer(m_stream, b);
+
+    if (m_monitor) {
+        m_monitor->observe(time, start, pw_stream_get_nsec(m_stream), numFrames, peak);
+    }
+}
+
+// Called from "pw-loop" thread
+void PwMonitor::observe(const pw_time& time, int64_t start, int64_t end, uint32_t frames, float peak)
+{
+    if (time.rate.denom == 0 || frames == 0) {
+        return;
+    }
+    const double graphRate = static_cast<double>(time.rate.denom) / time.rate.num;
+    const double periodS = frames / graphRate;
+    periodMs = periodS * 1000.0;
+
+    // Underruns: the graph's clock (ticks, frames played) goes on, while the frames it took from
+    // the stream don't (a cycle that found none queued). PipeWire doesn't count them for a stream
+    const int64_t taken = static_cast<int64_t>(framesQueued) - static_cast<int64_t>(time.queued);
+    const int64_t starved = static_cast<int64_t>(time.ticks) - taken;
+    framesQueued += frames;
+
+    // Startup isn't counted (the first cycles come before anything sounds), nor a stream that
+    // wasn't run for a while (moved, suspended): what was missed then isn't an underrun
+    const bool gap = lastNow > 0 && time.now - lastNow > 1'000'000'000;
+    lastNow = time.now;
+    if (restartCounting.exchange(false)) {
+        callbacksSinceStart = 0;
+    }
+    if (++callbacksSinceStart <= 20 || gap) {
+        lastStarved = starved;
+        return;
+    }
+    const int64_t starvedFrames = starved - lastStarved;
+    lastStarved = starved;
+
+    // This callback's frames are needed by the next cycle: the one after that the time is of
+    double headroomMs = (time.now + periodS * 1e9 - end) / 1e6;
+    Gathered& g = gathering;
+    ++g.callbacks;
+    if (starvedFrames > frames / 2) {
+        ++g.underruns;
+        headroomMs = std::min(headroomMs, -starvedFrames / graphRate * 1000.0);
+        LOGW() << "underrun: the graph played " << starvedFrames / graphRate * 1000.0 << " ms without the stream's frames";
+    }
+    g.headroomSumMs += headroomMs;
+    g.headroomMinMs = std::min(g.headroomMinMs, headroomMs);
+    const double load = (end - start) / (periodS * 1e9) * 100.0;
+    g.loadSum += load;
+    g.loadMax = std::max(g.loadMax, load);
+    // From this callback to its first frame played: the next cycle, after what is still queued,
+    // and the graph's delay to the device
+    const double delayS = static_cast<double>(time.delay) * time.rate.num / time.rate.denom;
+    const double latencyMs = ((time.now - start) / 1e9 + periodS + (time.queued + time.buffered) / graphRate + delayS)
+                             * 1000.0;
+    if (latencyMs > 0.0) {
+        g.latencySumMs += latencyMs;
+        ++g.latencyCount;
+    }
+    g.peak = std::max(g.peak, peak);
+
+    if (windowMutex.try_lock()) {
+        gathered.add(g);
+        if (g.latencyCount > 0) {
+            lastLatencyMs = g.latencySumMs / g.latencyCount;
+        }
+        windowMutex.unlock();
+        g = {};
+    }
 }
 
 PwAudioDriver::PwAudioDriver()
+    : m_monitor{std::make_unique<PwMonitor>()}
 {
     static bool initDone = false;
 
@@ -619,7 +802,26 @@ bool PwAudioDriver::open(const Spec& spec, Spec* activeSpec)
     LOGI() << "Connecting to " << spec.deviceId << " / " << spec.output.sampleRate << "Hz / "
            << spec.output.samplesPerChannel << " samples";
 
-    m_stream = std::make_unique<PwStream>(m_core, spec, spec.deviceId);
+    // The margin's levels: the block, twice, four times (a cycle of 5.3, 10.7, 21.3 ms for 256 frames
+    // at 48 kHz). A smaller quantum than the block would bring back the alignment buffer
+    {
+        std::vector<uint32_t> levels;
+        const uint32_t block = std::max<uint32_t>(spec.output.samplesPerChannel, MINIMUM_BUFFER_SIZE);
+        for (uint32_t frames = block; frames <= MAXIMUM_BUFFER_SIZE && levels.size() < 3; frames *= 2) {
+            levels.push_back(frames);
+        }
+        if (levels.empty()) {
+            levels.push_back(block);
+        }
+        std::scoped_lock lock { m_monitor->levelsMutex };
+        m_monitor->levelFrames = std::move(levels);
+        m_monitor->rate = static_cast<double>(spec.output.sampleRate);
+    }
+    m_monitor->restart();
+    m_monitor->periodMs = 0.0;
+
+    m_stream = std::make_unique<PwStream>(m_core, spec, spec.deviceId,
+                                          m_monitor->levelFramesFor(m_monitor->requestedLevel), m_monitor.get());
 
     m_formatSpec = m_stream->spec();
     if (activeSpec) {
@@ -690,4 +892,71 @@ std::vector<sample_rate_t> PwAudioDriver::availableOutputDeviceSampleRates() con
         88200,
         96000,
     };
+}
+
+IAudioOutputMonitor::Window PwAudioDriver::takeWindow()
+{
+    PwMonitor::Gathered g;
+    double latencyMs = 0.0;
+    {
+        std::scoped_lock lock { m_monitor->windowMutex };
+        g = m_monitor->gathered;
+        m_monitor->gathered = {};
+        latencyMs = m_monitor->lastLatencyMs;
+    }
+
+    Window w;
+    w.callbacks = g.callbacks;
+    w.underruns = g.underruns;
+    if (g.callbacks > 0) {
+        w.headroomMeanMs = g.headroomSumMs / g.callbacks;
+        w.headroomMinMs = g.headroomMinMs;
+        w.loadMeanPercent = g.loadSum / g.callbacks;
+        w.loadMaxPercent = g.loadMax;
+    }
+    w.outputLatencyMs = latencyMs;
+    w.outputPeak = g.peak;
+    return w;
+}
+
+double PwAudioDriver::periodMs() const
+{
+    return isOpened() ? m_monitor->periodMs.load() : 0.0;
+}
+
+std::vector<double> PwAudioDriver::marginLevelsMs() const
+{
+    std::vector<double> levels;
+    if (!isOpened()) {
+        return levels;
+    }
+    std::scoped_lock lock { m_monitor->levelsMutex };
+    for (const uint32_t frames : m_monitor->levelFrames) {
+        levels.push_back(m_monitor->rate > 0.0 ? frames * 1000.0 / m_monitor->rate : 0.0);
+    }
+    return levels;
+}
+
+size_t PwAudioDriver::marginLevel() const
+{
+    std::scoped_lock lock { m_monitor->levelsMutex };
+    const size_t count = m_monitor->levelFrames.size();
+    return count ? std::min(m_monitor->requestedLevel.load(), count - 1) : 0;
+}
+
+void PwAudioDriver::setMarginLevel(size_t level)
+{
+    if (m_monitor->requestedLevel.exchange(level) == level || !m_core) {
+        return;
+    }
+    PwLoopLock lk { m_loop };
+    if (m_stream) {
+        m_monitor->restartCounting = true;
+        m_stream->setLatency(m_monitor->levelFramesFor(level));
+    }
+}
+
+void PwAudioDriver::delayNextCallback(double ms)
+{
+    m_monitor->delayMs = ms;
 }
