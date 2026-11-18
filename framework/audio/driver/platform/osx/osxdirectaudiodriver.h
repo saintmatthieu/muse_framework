@@ -31,13 +31,14 @@
 
 #include "common/audioworkgroup.h"
 #include "iaudiodriver.h"
+#include "iaudiooutputmonitor.h"
 
 struct AudioTimeStamp;
 struct AudioQueueBuffer;
 struct OpaqueAudioQueue;
 
 namespace muse::audio {
-class OSXDirectAudioDriver : public IAudioDriver
+class OSXDirectAudioDriver : public IAudioDriver, public IAudioOutputMonitor
 {
 public:
     OSXDirectAudioDriver();
@@ -66,7 +67,15 @@ public:
     AudioWorkGroup getAudioWorkGroup() const override;
     async::Notification currentWorkgroupChanged() const override;
 
+    Window takeWindow() override;
+    double periodMs() const override;
+    std::vector<double> marginLevelsMs() const override;
+    size_t marginLevel() const override;
+    void setMarginLevel(size_t level) override;
+    void delayNextCallback(double ms) override;
+
     struct Data;
+    struct Monitor;
 
 private:
     static void logError(const std::string message, OSStatus error);
@@ -74,12 +83,14 @@ private:
     void initDeviceMapListener();
     void removeDeviceMapListener();
     void doClose();
+    uint32_t setUpMonitor(UInt32 deviceId, const OutputSpec& output);
 
     std::optional<int> getAudioDeviceId(const AudioDeviceID& deviceId) const;
 
     UInt32 osxDeviceId() const;
 
     std::unique_ptr<Data> m_data = nullptr;
+    std::shared_ptr<Monitor> m_monitor;
     async::Channel<Spec> m_activeSpecChanged;
     std::map<unsigned int, std::string> m_outputDevices = {}, m_inputDevices = {};
     mutable std::mutex m_devicesMutex;

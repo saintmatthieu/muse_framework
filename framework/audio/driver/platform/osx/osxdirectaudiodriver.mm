@@ -34,8 +34,12 @@
 #include <mutex>
 
 #include <AudioToolbox/AudioToolbox.h>
+#include <CoreAudio/HostTime.h>
+#include <cmath>
+#include <limits>
 #include <optional>
 #include <string_view>
+#include <thread>
 
 #include "common/audiotypes.h"
 #include "common/audioworkgroup.h"
@@ -54,8 +58,151 @@ struct ChannelBufferDetails {
     unsigned int dataStrideSamples;
 };
 
+//! NOTE What IAudioOutputMonitor tells: set up at open, before the IOProc starts; gathered on the
+//! IOProc's thread and handed over when the lock is free (the IOProc never waits for it)
+struct OSXDirectAudioDriver::Monitor {
+    struct Gathered {
+        uint32_t callbacks = 0;
+        uint32_t underruns = 0;
+        uint32_t clockStalls = 0;
+        double headroomSumMs = 0.0;
+        double headroomMinMs = std::numeric_limits<double>::infinity();
+        double loadSum = 0.0;
+        double loadMax = 0.0;
+        double latencySumMs = 0.0;
+        uint32_t latencyCount = 0;
+        float peak = 0.0f;
+
+        void add(const Gathered& o)
+        {
+            callbacks += o.callbacks;
+            underruns += o.underruns;
+            clockStalls += o.clockStalls;
+            headroomSumMs += o.headroomSumMs;
+            headroomMinMs = std::min(headroomMinMs, o.headroomMinMs);
+            loadSum += o.loadSum;
+            loadMax = std::max(loadMax, o.loadMax);
+            latencySumMs += o.latencySumMs;
+            latencyCount += o.latencyCount;
+            peak = std::max(peak, o.peak);
+        }
+    };
+
+    //! NOTE Set at open, before the IOProc starts
+    double rate = 0.0;
+    double safetyOffsetS = 0.0; // the HAL's distance ahead of the device's read position
+    double presentationLatencyS = 0.0; // from the device's buffer to the sound: device's and stream's latency
+
+    //! NOTE The levels: the device's buffer in frames. Under levelsMutex
+    mutable std::mutex levelsMutex;
+    std::vector<uint32_t> levelFrames;
+    uint32_t bufferFrames = 0; // the device's
+
+    std::atomic<size_t> requestedLevel { std::numeric_limits<size_t>::max() }; // the last, until chosen
+    std::atomic<double> delayMs { 0.0 };
+    //! NOTE Set when the level changes: the HAL restarts the device's cycles at the new size, the
+    //! stream's position may jump, which is no underrun of the app's (and happens while nothing sounds)
+    std::atomic<bool> restartCounting { false };
+
+    uint32_t levelFramesFor(size_t level) const // under levelsMutex
+    {
+        return levelFrames.empty() ? 0 : levelFrames[std::min(level, levelFrames.size() - 1)];
+    }
+
+    //! NOTE The IOProc's thread
+    Gathered gathering;
+    uint64_t callbacksSinceStart = 0;
+    double expectedSampleTime = -1.0;
+
+    std::mutex windowMutex;
+    Gathered gathered; // under windowMutex
+    double lastLatencyMs = 0.0; // under windowMutex
+
+    void th_startOver()
+    {
+        gathering = {};
+        callbacksSinceStart = 0;
+        expectedSampleTime = -1.0;
+    }
+
+    void th_record(const AudioTimeStamp* outputTime, UInt64 startHost, UInt64 endHost, uint32_t frames, float peak);
+};
+
+static double hostToSeconds(UInt64 hostTime)
+{
+    return AudioConvertHostTimeToNanos(hostTime) * 1e-9;
+}
+
+void OSXDirectAudioDriver::Monitor::th_record(const AudioTimeStamp* outputTime, UInt64 startHost, UInt64 endHost, uint32_t frames,
+                                              float peak)
+{
+    if (rate <= 0.0 || frames == 0) {
+        return;
+    }
+
+    if (restartCounting.exchange(false)) {
+        callbacksSinceStart = 0;
+        expectedSampleTime = -1.0;
+    }
+
+    // Cycles the HAL skipped (it does when a cycle overloads): the stream's position jumps, and the
+    // device played silence there, whoever was late
+    uint32_t clockStalls = 0;
+    const bool sampleTimeValid = outputTime && (outputTime->mFlags & kAudioTimeStampSampleTimeValid);
+    if (sampleTimeValid) {
+        if (expectedSampleTime >= 0.0 && callbacksSinceStart > 20) {
+            const double skippedFrames = outputTime->mSampleTime - expectedSampleTime;
+            if (skippedFrames > frames / 2.0) {
+                ++clockStalls;
+                LOGW() << "the device skipped " << skippedFrames / rate * 1000.0 << " ms of the stream";
+            }
+        }
+        expectedSampleTime = outputTime->mSampleTime + frames;
+    }
+
+    // Startup isn't counted: the first callbacks come irregularly, before anything sounds
+    if (++callbacksSinceStart <= 20) {
+        return;
+    }
+
+    const bool hostTimeValid = outputTime && (outputTime->mFlags & kAudioTimeStampHostTimeValid);
+    const double start = hostToSeconds(startHost);
+    const double end = hostToSeconds(endHost);
+
+    Gathered& g = gathering;
+    ++g.callbacks;
+    g.clockStalls += clockStalls;
+    if (hostTimeValid) {
+        // The frames are needed when the device's read position, plus the safety offset, reaches them
+        const double outputStart = hostToSeconds(outputTime->mHostTime);
+        const double headroomMs = (outputStart - safetyOffsetS - end) * 1000.0;
+        g.headroomSumMs += headroomMs;
+        g.headroomMinMs = std::min(g.headroomMinMs, headroomMs);
+        if (headroomMs < 0.0) {
+            ++g.underruns;
+            LOGW() << "underrun: written " << -headroomMs << " ms after the device needed it";
+        }
+        g.latencySumMs += (outputStart - start + presentationLatencyS) * 1000.0;
+        ++g.latencyCount;
+    }
+    const double load = (end - start) / (frames / rate) * 100.0;
+    g.loadSum += load;
+    g.loadMax = std::max(g.loadMax, load);
+    g.peak = std::max(g.peak, peak);
+
+    if (windowMutex.try_lock()) {
+        gathered.add(g);
+        if (g.latencyCount > 0) {
+            lastLatencyMs = g.latencySumMs / g.latencyCount;
+        }
+        windowMutex.unlock();
+        g = {};
+    }
+}
+
 struct OSXDirectAudioDriver::Data {
     Spec format;
+    std::shared_ptr<Monitor> monitor;
     AudioDeviceIOProcID procId{};
     bool canBeDirectlyMapped = false;
 
@@ -70,6 +217,7 @@ struct OSXDirectAudioDriver::Data {
     Data& operator=(const Data& other)
     {
         format = other.format;
+        monitor = other.monitor;
         procId = other.procId;
         canBeDirectlyMapped = other.canBeDirectlyMapped;
         deviceId = other.deviceId;
@@ -99,7 +247,7 @@ async::Notification OSXDirectAudioDriver::currentWorkgroupChanged() const
 } // namespace muse::audio
 
 OSXDirectAudioDriver::OSXDirectAudioDriver()
-    : m_data(std::make_unique<Data>())
+    : m_data(std::make_unique<Data>()), m_monitor(std::make_shared<Monitor>())
 {
     initDeviceMapListener();
     updateDeviceMap();
@@ -182,41 +330,38 @@ static std::optional<uint32_t> getSameRequestedSampleCount(const AudioBufferList
     return sampleCount;
 }
 
-//TODO: make use of timing parameters
-static int coreAudioIOProc(AudioObjectID /* inDevice*/,
-                           const AudioTimeStamp* /* inNow */,
-                           const AudioBufferList* /* inInputData */,
-                           const AudioTimeStamp* /*  inInputTime */,
-                           AudioBufferList* outOutputData,
-                           const AudioTimeStamp* /* inOutputTime */,
-                           void* __nullable inClientData)
+//! NOTE The loudest sample of the first two channels, interleaved by stride
+static float peakOf(const float* samples, uint32_t frames, uint32_t stride)
 {
-    auto* data = reinterpret_cast<OSXDirectAudioDriver::Data*>(inClientData);
-    if (data->stopPending) {
-        AudioDeviceStop(data->deviceId, data->procId);
-        data->stopPending = false;
-        data->stopped = true;
-        return noErr;
+    float peak = 0.0f;
+    if (!samples || stride == 0) {
+        return peak;
     }
-    if (data->channelBufferOutputDetails.empty()) {
-        return noErr;
+    for (uint32_t i = 0; i < frames; ++i) {
+        peak = std::max(peak, std::abs(samples[i * stride]));
+        if (stride > 1) {
+            peak = std::max(peak, std::abs(samples[i * stride + 1]));
+        }
     }
+    return peak;
+}
 
+//! NOTE Renders into the device's buffers; the frames rendered and their peak
+static uint32_t renderOutput(OSXDirectAudioDriver::Data* data, AudioBufferList* outOutputData, float& peak)
+{
     uint32_t samplesPerChannel = callbackSamplesPerChannel(outOutputData, data->channelBufferOutputDetails);
     if (samplesPerChannel == 0) {
-        return noErr;
+        return 0;
     }
 
     const uint32_t callbackDataStride = data->format.output.audioChannelCount;
     int dataSize = static_cast<int>(samplesPerChannel * callbackDataStride * sizeof(float));
     if (data->canBeDirectlyMapped && getSameRequestedSampleCount(outOutputData,
                                                                  data->channelBufferOutputDetails).value_or(0) == samplesPerChannel) {
-        data->format.callback(
-            (uint8_t*)outOutputData
-            ->mBuffers[data->channelBufferOutputDetails[0].streamNumber]
-            .mData,
-            dataSize);
-        return 0;
+        float* samples = static_cast<float*>(outOutputData->mBuffers[data->channelBufferOutputDetails[0].streamNumber].mData);
+        data->format.callback((uint8_t*)samples, dataSize);
+        peak = peakOf(samples, samplesPerChannel, callbackDataStride);
+        return samplesPerChannel;
     }
 
     if (data->outBuffer.size() < static_cast<size_t>(samplesPerChannel) * callbackDataStride) {
@@ -225,6 +370,7 @@ static int coreAudioIOProc(AudioObjectID /* inDevice*/,
     }
 
     data->format.callback((uint8_t*)data->outBuffer.data(), dataSize);
+    peak = peakOf(data->outBuffer.data(), samplesPerChannel, callbackDataStride);
 
     for (int ch = 0; ch < (int)data->channelBufferOutputDetails.size(); ++ch) {
         const auto& details = data->channelBufferOutputDetails[ch];
@@ -251,7 +397,44 @@ static int coreAudioIOProc(AudioObjectID /* inDevice*/,
             src += callbackDataStride;
         }
     }
-    return 0;
+    return samplesPerChannel;
+}
+
+static int coreAudioIOProc(AudioObjectID /* inDevice*/,
+                           const AudioTimeStamp* /* inNow */,
+                           const AudioBufferList* /* inInputData */,
+                           const AudioTimeStamp* /*  inInputTime */,
+                           AudioBufferList* outOutputData,
+                           const AudioTimeStamp* inOutputTime,
+                           void* __nullable inClientData)
+{
+    auto* data = reinterpret_cast<OSXDirectAudioDriver::Data*>(inClientData);
+    if (data->stopPending) {
+        AudioDeviceStop(data->deviceId, data->procId);
+        data->stopPending = false;
+        data->stopped = true;
+        return noErr;
+    }
+    if (data->channelBufferOutputDetails.empty()) {
+        return noErr;
+    }
+
+    OSXDirectAudioDriver::Monitor* monitor = data->monitor.get();
+
+    // Testing the detection: as if woken late
+    if (monitor) {
+        if (const double delayMs = monitor->delayMs.exchange(0.0); delayMs > 0.0) {
+            std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>(delayMs * 1000.0)));
+        }
+    }
+
+    const UInt64 start = AudioGetCurrentHostTime();
+    float peak = 0.0f;
+    const uint32_t frames = renderOutput(data, outOutputData, peak);
+    if (monitor) {
+        monitor->th_record(inOutputTime, start, AudioGetCurrentHostTime(), frames, peak);
+    }
+    return noErr;
 }
 
 std::optional<std::array<uint32_t, 2> > getPreferredStereoHardwareChannels(OSXAudioDeviceID deviceId)
@@ -597,6 +780,100 @@ static std::optional<OutputSpec> prepareDeviceWithOutputSpec(OSXAudioDeviceID de
     };
 }
 
+static std::optional<UInt32> getOutputUInt32(AudioObjectID objectId, AudioObjectPropertySelector selector)
+{
+    AudioObjectPropertyAddress address { selector, kAudioDevicePropertyScopeOutput, kAudioObjectPropertyElementMaster };
+    UInt32 value = 0;
+    UInt32 size = sizeof(value);
+    if (AudioObjectGetPropertyData(objectId, &address, 0, nullptr, &size, &value) != noErr) {
+        return std::nullopt;
+    }
+    return value;
+}
+
+//! NOTE The margin is the device's buffer: the IOProc renders a buffer in the time the device plays
+//! the one before (a cycle), which is also what the buffer adds to the latency. So a level is a
+//! buffer size: the engine's block, twice, four times (5.3, 10.7, 21.3 ms for 256 frames at 48 kHz),
+//! as PipeWire's quantum. The engine's block stays the spec's, the least level: a callback asking
+//! for more renders it all at once. The buffer changes on the running device. Returns the buffer
+//! to open with
+uint32_t OSXDirectAudioDriver::setUpMonitor(OSXAudioDeviceID deviceId, const OutputSpec& output)
+{
+    AudioValueRange range { 0, 0 };
+    UInt32 rangeSize = sizeof(range);
+    AudioObjectPropertyAddress rangeAddress { kAudioDevicePropertyBufferFrameSizeRange, kAudioObjectPropertyScopeGlobal,
+                                              kAudioObjectPropertyElementMaster };
+    AudioObjectGetPropertyData(deviceId, &rangeAddress, 0, nullptr, &rangeSize, &range);
+    const uint32_t least = std::max(static_cast<uint32_t>(range.mMinimum), static_cast<uint32_t>(MINIMUM_BUFFER_SIZE));
+    const uint32_t most = std::min(range.mMaximum > 0 ? static_cast<uint32_t>(range.mMaximum) : static_cast<uint32_t>(MAXIMUM_BUFFER_SIZE),
+                                   static_cast<uint32_t>(MAXIMUM_BUFFER_SIZE));
+
+    std::vector<uint32_t> levels;
+    const uint32_t block = static_cast<uint32_t>(output.samplesPerChannel);
+    for (uint32_t frames = block; least <= most && frames > 0 && levels.size() < 3; frames *= 2) {
+        const uint32_t clamped = std::clamp(frames, least, most);
+        if (levels.empty() || levels.back() != clamped) {
+            levels.push_back(clamped);
+        }
+    }
+
+    const double rate = static_cast<double>(output.sampleRate);
+    const UInt32 safetyOffset = getOutputUInt32(deviceId, kAudioDevicePropertySafetyOffset).value_or(0);
+    UInt32 presentationLatency = getOutputUInt32(deviceId, kAudioDevicePropertyLatency).value_or(0);
+    if (!m_data->channelBufferOutputDetails.empty()) {
+        AudioObjectPropertyAddress streamsAddress { kAudioDevicePropertyStreams, kAudioDevicePropertyScopeOutput,
+                                                    kAudioObjectPropertyElementMaster };
+        UInt32 size = 0;
+        if (AudioObjectGetPropertyDataSize(deviceId, &streamsAddress, 0, nullptr, &size) == noErr && size > 0) {
+            std::vector<AudioStreamID> streams(size / sizeof(AudioStreamID));
+            const size_t stream = static_cast<size_t>(m_data->channelBufferOutputDetails[0].streamNumber);
+            if (AudioObjectGetPropertyData(deviceId, &streamsAddress, 0, nullptr, &size, streams.data()) == noErr
+                && stream < streams.size()) {
+                AudioObjectPropertyAddress latencyAddress { kAudioStreamPropertyLatency, kAudioObjectPropertyScopeGlobal,
+                                                            kAudioObjectPropertyElementMaster };
+                UInt32 streamLatency = 0;
+                UInt32 latencySize = sizeof(streamLatency);
+                if (AudioObjectGetPropertyData(streams[stream], &latencyAddress, 0, nullptr, &latencySize, &streamLatency) == noErr) {
+                    presentationLatency += streamLatency;
+                }
+            }
+        }
+    }
+
+    std::string listed;
+    for (const uint32_t frames : levels) {
+        listed += (listed.empty() ? "" : ", ") + std::to_string(frames);
+    }
+    LOGI() << "margin levels (buffer frames): " << listed << ", block: " << output.samplesPerChannel
+           << ", safety offset: " << safetyOffset << ", device and stream latency: " << presentationLatency << " frames";
+
+    Monitor& m = *m_monitor;
+    std::scoped_lock lock { m.levelsMutex };
+    m.th_startOver(); // the IOProc isn't running
+    m.rate = rate;
+    m.safetyOffsetS = rate > 0.0 ? safetyOffset / rate : 0.0;
+    m.presentationLatencyS = rate > 0.0 ? presentationLatency / rate : 0.0;
+    m.levelFrames = std::move(levels);
+    m.bufferFrames = m.levelFramesFor(m.requestedLevel);
+    return m.bufferFrames;
+}
+
+static std::optional<UInt32> setBufferFrames(OSXAudioDeviceID deviceId, UInt32 frames)
+{
+    AudioObjectPropertyAddress address { kAudioDevicePropertyBufferFrameSize, kAudioObjectPropertyScopeGlobal,
+                                         kAudioObjectPropertyElementMaster };
+    if (OSStatus result = AudioObjectSetPropertyData(deviceId, &address, 0, nullptr, sizeof(frames), &frames); result != noErr) {
+        LOGE() << "Failed to set the device's buffer to " << frames << " frames, err: " << result;
+        return std::nullopt;
+    }
+    UInt32 actual = 0;
+    UInt32 size = sizeof(actual);
+    if (AudioObjectGetPropertyData(deviceId, &address, 0, nullptr, &size, &actual) != noErr) {
+        return std::nullopt;
+    }
+    return actual;
+}
+
 AudioWorkGroup createAudioWorkgroup(OSXAudioDeviceID deviceId)
 {
     AudioObjectPropertyAddress pa;
@@ -648,9 +925,22 @@ bool OSXDirectAudioDriver::open(const Spec& spec, Spec* activeSpec)
     m_data->format.output = actualOutputSpec.value();
     m_data->format.deviceId = QString::number(*deviceId).toStdString();
     m_data->channelBufferOutputDetails = std::move(bestOutputStreamInfos);
-    m_data->outBuffer.resize(m_data->format.output.samplesPerChannel
-                             * m_data->format.output.audioChannelCount);
     m_data->deviceId = *deviceId;
+    m_data->monitor = m_monitor;
+    // The device's buffer is the margin's level, the engine's block the spec's (see setUpMonitor)
+    if (const uint32_t bufferFrames = setUpMonitor(*deviceId, m_data->format.output);
+        bufferFrames > 0 && bufferFrames != m_data->format.output.samplesPerChannel) {
+        if (const std::optional<UInt32> actual = setBufferFrames(*deviceId, bufferFrames)) {
+            std::scoped_lock lock { m_monitor->levelsMutex };
+            m_monitor->bufferFrames = *actual;
+        }
+    }
+    {
+        std::scoped_lock lock { m_monitor->levelsMutex };
+        const uint32_t largest = m_monitor->levelFrames.empty() ? 0 : m_monitor->levelFrames.back();
+        m_data->outBuffer.resize(std::max<size_t>({ m_data->format.output.samplesPerChannel, largest, m_monitor->bufferFrames })
+                                 * m_data->format.output.audioChannelCount);
+    }
 
     auto result = AudioDeviceCreateIOProcID(*deviceId, coreAudioIOProc, m_data.get(),
                                             &m_data->procId);
@@ -715,6 +1005,88 @@ void OSXDirectAudioDriver::doClose()
 bool OSXDirectAudioDriver::isOpened() const
 {
     return m_data->procId != nullptr;
+}
+
+IAudioOutputMonitor::Window OSXDirectAudioDriver::takeWindow()
+{
+    Monitor::Gathered g;
+    double latencyMs = 0.0;
+    {
+        std::scoped_lock lock { m_monitor->windowMutex };
+        g = m_monitor->gathered;
+        m_monitor->gathered = {};
+        latencyMs = m_monitor->lastLatencyMs;
+    }
+
+    Window w;
+    w.callbacks = g.callbacks;
+    w.underruns = g.underruns;
+    w.clockStalls = g.clockStalls;
+    if (g.callbacks > 0) {
+        w.headroomMeanMs = g.headroomSumMs / g.callbacks;
+        w.headroomMinMs = g.headroomMinMs;
+        w.loadMeanPercent = g.loadSum / g.callbacks;
+        w.loadMaxPercent = g.loadMax;
+    }
+    w.outputLatencyMs = latencyMs;
+    w.outputPeak = g.peak;
+    return w;
+}
+
+double OSXDirectAudioDriver::periodMs() const
+{
+    if (!isOpened()) {
+        return 0.0;
+    }
+    std::scoped_lock lock { m_monitor->levelsMutex };
+    return m_monitor->rate > 0.0 ? m_monitor->bufferFrames * 1000.0 / m_monitor->rate : 0.0;
+}
+
+std::vector<double> OSXDirectAudioDriver::marginLevelsMs() const
+{
+    std::vector<double> levels;
+    if (!isOpened()) {
+        return levels;
+    }
+    std::scoped_lock lock { m_monitor->levelsMutex };
+    for (const uint32_t frames : m_monitor->levelFrames) {
+        levels.push_back(m_monitor->rate > 0.0 ? frames * 1000.0 / m_monitor->rate : 0.0);
+    }
+    return levels;
+}
+
+size_t OSXDirectAudioDriver::marginLevel() const
+{
+    std::scoped_lock lock { m_monitor->levelsMutex };
+    const size_t count = m_monitor->levelFrames.size();
+    return count ? std::min(m_monitor->requestedLevel.load(), count - 1) : 0;
+}
+
+void OSXDirectAudioDriver::setMarginLevel(size_t level)
+{
+    if (m_monitor->requestedLevel.exchange(level) == level || !isOpened()) {
+        return;
+    }
+    uint32_t frames = 0;
+    {
+        std::scoped_lock lock { m_monitor->levelsMutex };
+        frames = m_monitor->levelFramesFor(level);
+    }
+    if (frames == 0) {
+        return;
+    }
+    // The IOProc's buffer (outBuffer) holds the largest level
+    m_monitor->restartCounting = true;
+    if (const std::optional<UInt32> actual = setBufferFrames(m_data->deviceId, frames)) {
+        std::scoped_lock lock { m_monitor->levelsMutex };
+        m_monitor->bufferFrames = *actual;
+        LOGI() << "margin level " << level << ": the device's buffer is " << *actual << " frames";
+    }
+}
+
+void OSXDirectAudioDriver::delayNextCallback(double ms)
+{
+    m_monitor->delayMs = ms;
 }
 
 const OSXDirectAudioDriver::Spec& OSXDirectAudioDriver::activeSpec() const
