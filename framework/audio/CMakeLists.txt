@@ -29,6 +29,7 @@ endif()
 target_sources(muse_audio PRIVATE
     # Common public
     iaudiodriver.h
+    iaudiooutputmonitor.h
     iaudiodrivercontroller.h
     devtools/inputlag.h
 )

@@ -26,9 +26,10 @@
 #include <atomic>
 
 #include "iaudiodriver.h"
+#include "iaudiooutputmonitor.h"
 
 namespace muse::audio {
-class WasapiAudioDriver : public IAudioDriver
+class WasapiAudioDriver : public IAudioDriver, public IAudioOutputMonitor
 {
 public:
     WasapiAudioDriver();
@@ -51,12 +52,20 @@ public:
     std::vector<samples_t> availableOutputDeviceBufferSizes() const override;
     std::vector<sample_rate_t> availableOutputDeviceSampleRates() const override;
 
+    Window takeWindow() override;
+    double periodMs() const override;
+    std::vector<double> marginLevelsMs() const override;
+    size_t marginLevel() const override;
+    void setMarginLevel(size_t level) override;
+    void delayNextCallback(double ms) override;
+
 private:
     void updateAudioDeviceList();
 
     void th_audioThread();
     bool th_audioInitialize();
     void th_processAudioData();
+    double th_measureClock(double now, uint32_t& clockStalls);
 
     void doClose();
 

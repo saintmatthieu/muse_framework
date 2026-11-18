@@ -27,6 +27,11 @@
 #include <mmdeviceapi.h>
 #include <functiondiscoverykeys_devpkey.h>
 
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <mutex>
+
 #include "global/defer.h"
 #include "global/translation.h"
 
@@ -82,9 +87,71 @@ struct WasapiAudioDriver::Data {
     IAudioRenderClient* renderClient = nullptr;
     WAVEFORMATEX* mixFormat = nullptr;
     HANDLE audioEvent = nullptr;
+    IAudioClock* audioClock = nullptr;
+    UINT64 clockFrequency = 0;
+
+    //! NOTE The margin kept (see th_audioInitialize): at most so many frames queued after a write,
+    //! one level per whole period. Written on the audio thread (opening),
+    //! read there, and under the lock by the monitor's reader
+    mutable std::mutex levelsMutex;
+    std::vector<uint32_t> levelFrames;
+    std::atomic<size_t> requestedLevel { std::numeric_limits<size_t>::max() }; // the last, until chosen
+    std::atomic<double> periodMs { 0.0 };
+    std::atomic<double> delayMs { 0.0 };
+
+    //! NOTE What the monitor's windows are made of: gathered on the audio thread, handed over when
+    //! the lock is free (the audio thread never waits for it)
+    struct Gathered {
+        uint32_t callbacks = 0;
+        uint32_t underruns = 0;
+        uint32_t clockStalls = 0;
+        double headroomSumMs = 0.0;
+        double headroomMinMs = std::numeric_limits<double>::infinity();
+        double loadSum = 0.0;
+        double loadMax = 0.0;
+        double latencySumMs = 0.0;
+        uint32_t latencyCount = 0;
+        float peak = 0.0f;
+
+        void add(const Gathered& o)
+        {
+            callbacks += o.callbacks;
+            underruns += o.underruns;
+            clockStalls += o.clockStalls;
+            headroomSumMs += o.headroomSumMs;
+            headroomMinMs = std::min(headroomMinMs, o.headroomMinMs);
+            loadSum += o.loadSum;
+            loadMax = std::max(loadMax, o.loadMax);
+            latencySumMs += o.latencySumMs;
+            latencyCount += o.latencyCount;
+            peak = std::max(peak, o.peak);
+        }
+    };
+    Gathered gathering; // audio thread
+    std::mutex windowMutex;
+    Gathered gathered; // under windowMutex
+    double lastLatencyMs = 0.0; // under windowMutex
+
+    //! NOTE Audio thread: when the device's passes are (each signals the event), on the
+    //! performance counter's clock, in seconds; the stream's position at the last callback
+    double rate = 0.0;
+    uint32_t periodFrames = 0;
+    double periodS = 0.0;
+    double expectedEvent = 0.0; // 0: not known yet
+    double lastWriteEvent = 0.0; // the event of the last callback that wrote
+    double queuedAfterLastWrite = 0.0;
+    uint64_t callbacksSinceStart = 0;
+    UINT64 framesWritten = 0;
+    double lastPlaying = -1.0;
+    double lastPlayingTime = 0.0;
 
     void releaseClient()
     {
+        if (audioClock) {
+            audioClock->Release();
+            audioClock = nullptr;
+        }
+
         if (audioEvent) {
             CloseHandle(audioEvent);
             audioEvent = nullptr;
@@ -472,6 +539,7 @@ bool WasapiAudioDriver::th_audioInitialize()
     //! engine's block is shorter than that, ask for a shorter period (low-latency shared mode,
     //! IAudioClient3), the shortest that still holds the block: it is then rendered on every callback
     HRESULT hr = E_NOTIMPL;
+    UINT32 streamPeriod = 0;
     IAudioClient3* audioClient3 = nullptr;
     if (SUCCEEDED(m_data->audioClient->QueryInterface(__uuidof(IAudioClient3), (void**)&audioClient3))) {
         UINT32 defaultPeriod = 0;
@@ -496,6 +564,7 @@ bool WasapiAudioDriver::th_audioInitialize()
 
             hr = audioClient3->InitializeSharedAudioStream(AUDCLNT_STREAMFLAGS_EVENTCALLBACK, period, m_data->mixFormat, nullptr);
             if (SUCCEEDED(hr)) {
+                streamPeriod = period;
                 LOGI() << "low-latency shared mode, period: " << period << " frames";
             } else {
                 //! NOTE e.g. AUDCLNT_E_ENGINE_PERIODICITY_LOCKED: another stream holds another period
@@ -506,8 +575,13 @@ bool WasapiAudioDriver::th_audioInitialize()
     }
 
     if (FAILED(hr)) {
-        REFERENCE_TIME bufferDuration = to_reftime(m_activeSpec.output.samplesPerChannel,
-                                                   m_activeSpec.output.sampleRate);
+        //! NOTE Room for three periods (the margin's levels, see below), however short the block:
+        //! the buffer's size adds no latency, what is kept queued in it does
+        REFERENCE_TIME devicePeriod = 0;
+        m_data->audioClient->GetDevicePeriod(&devicePeriod, nullptr);
+        REFERENCE_TIME bufferDuration = std::max(to_reftime(m_activeSpec.output.samplesPerChannel,
+                                                            m_activeSpec.output.sampleRate),
+                                                 3 * devicePeriod);
 
         hr = m_data->audioClient->Initialize(
             AUDCLNT_SHAREMODE_SHARED,
@@ -544,6 +618,54 @@ bool WasapiAudioDriver::th_audioInitialize()
         return false;
     }
 
+    m_data->framesWritten = 0;
+    m_data->expectedEvent = 0.0;
+    m_data->lastWriteEvent = 0.0;
+    m_data->queuedAfterLastWrite = 0.0;
+    m_data->callbacksSinceStart = 0;
+    m_data->lastPlaying = -1.0;
+    hr = m_data->audioClient->GetService(__uuidof(IAudioClock), (void**)&m_data->audioClock);
+    if (SUCCEEDED(hr)) {
+        hr = m_data->audioClock->GetFrequency(&m_data->clockFrequency);
+    }
+    if (FAILED(hr) || m_data->clockFrequency == 0) {
+        LOGW() << "no audio clock, the output latency isn't measured, error: " << hrToString(hr);
+    }
+
+    //! NOTE Shared mode gives a buffer of about two periods or more, whatever is asked (970 frames for
+    //! 441-frame periods). Filled whole, what is written at each event waits behind what is left of
+    //! the last write (529 frames there, 12 ms). Queued only up to one period, it is played from the
+    //! next pass of Windows' audio engine (measured: 31.7 -> 19.7 ms from a callback to its first frame
+    //! played), but must be written before that pass, one period after the event, rather than two.
+    //! So the margin is chosen (IAudioOutputMonitor): one, two or three whole periods queued, each a
+    //! pass more to write in (half a period more gives no more time: a pass takes a whole one).
+    //! Never less than the engine's block, which then still renders on every callback it can.
+    //! (The period rounded: one frame short would drain the queue by a frame at each pass.)
+    const UINT32 period = streamPeriod ? streamPeriod
+                          : static_cast<UINT32>(std::llround(defaultPeriod * 1e-7 * m_activeSpec.output.sampleRate));
+    {
+        std::vector<uint32_t> levels;
+        for (UINT32 frames = period; period > 0 && frames <= m_bufferFrames && levels.size() < 3; frames += period) {
+            if (frames >= blockFrames) {
+                levels.push_back(frames);
+            }
+        }
+        if (levels.empty()) {
+            levels.push_back(m_bufferFrames);
+        }
+        std::string listed;
+        for (const uint32_t frames : levels) {
+            listed += (listed.empty() ? "" : ", ") + std::to_string(frames);
+        }
+        LOGI() << "margin levels (frames queued at most): " << listed << ", buffer: " << m_bufferFrames;
+        std::scoped_lock lock { m_data->levelsMutex };
+        m_data->levelFrames = std::move(levels);
+    }
+    m_data->rate = m_activeSpec.output.sampleRate;
+    m_data->periodFrames = period;
+    m_data->periodS = period / m_data->rate;
+    m_data->periodMs = period * 1000.0 / m_data->rate;
+
     m_data->audioEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
     if (!m_data->audioEvent) {
         LOGE() << "failed create audioEvent";
@@ -565,40 +687,89 @@ bool WasapiAudioDriver::th_audioInitialize()
     return true;
 }
 
+static double th_now()
+{
+    static const double frequency = [] {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        return static_cast<double>(f.QuadPart);
+    }();
+    LARGE_INTEGER counter;
+    QueryPerformanceCounter(&counter);
+    return counter.QuadPart / frequency;
+}
+
 void WasapiAudioDriver::th_processAudioData()
 {
+    Data& d = *m_data;
+
+    // Testing the detection: as if woken late
+    if (const double delayMs = d.delayMs.exchange(0.0); delayMs > 0.0) {
+        Sleep(static_cast<DWORD>(delayMs + 0.5));
+    }
+
+    const double start = th_now();
+
     // Get padding in existing buffer
     UINT32 paddingFrames = 0;
-    auto hr = m_data->audioClient->GetCurrentPadding(&paddingFrames);
+    auto hr = d.audioClient->GetCurrentPadding(&paddingFrames);
     if (FAILED(hr)) {
         LOGE() << "Failed to get current padding: " << hrToString(hr);
         return;
     }
 
+    // The pass whose event this is. Events come one period apart; one that fires while the last
+    // is still unanswered is lost (the event resets once); the wait returns after the event,
+    // never before, so one sooner than expected moves the expected ones earlier
+    double event = start;
+    double latenessS = 0.0;
+    if (d.expectedEvent > 0.0 && d.periodS > 0.0) {
+        latenessS = start - d.expectedEvent;
+        if (latenessS < 0.0 || latenessS > 10 * d.periodS) {
+            latenessS = 0.0; // re-anchored
+        } else {
+            event = d.expectedEvent;
+        }
+    }
+    const double missedPasses = d.periodS > 0.0 ? std::floor(latenessS / d.periodS) : 0.0;
+    d.expectedEvent = event + (missedPasses + 1.0) * d.periodS;
+
     // GetCurrentPadding represents the number of queued frames
     // so we can subtract that from the overall number of frames we have
-    const uint32_t framesAvailable = m_bufferFrames - paddingFrames;
+    uint32_t framesAvailable = m_bufferFrames - paddingFrames;
+    {
+        const std::vector<uint32_t>& levels = d.levelFrames; // only written on this thread
+        if (!levels.empty()) {
+            const uint32_t maxQueued = levels[std::min(d.requestedLevel.load(), levels.size() - 1)];
+            framesAvailable = paddingFrames < maxQueued ? std::min(framesAvailable, maxQueued - paddingFrames) : 0;
+        }
+    }
 
     // Only continue if we have buffer to write data
     if (framesAvailable == 0) {
         return;
     }
 
+    uint32_t clockStalls = 0;
+    const double latencyMs = th_measureClock(start, clockStalls);
+
     const uint32_t actualFramesToRead = framesAvailable;
 
     // WASAPI: "nBlockAlign must be equal to the product of nChannels and wBitsPerSample divided by 8 (bits per byte)"
-    const uint32_t clientFrameSize = m_data->mixFormat->nBlockAlign;
+    const uint32_t clientFrameSize = d.mixFormat->nBlockAlign;
 
     // MuseScore assumes only 2 audio channels (same calculation as above to determine frame size)
-    const uint32_t muFrameSize = 2 * m_data->mixFormat->wBitsPerSample / 8;
+    const uint32_t muFrameSize = 2 * d.mixFormat->wBitsPerSample / 8;
 
     uint8_t* data = nullptr;
-    hr = m_data->renderClient->GetBuffer(actualFramesToRead, &data);
+    hr = d.renderClient->GetBuffer(actualFramesToRead, &data);
     if (FAILED(hr)) {
         LOGE() << "Failed to get buffer: " << hrToString(hr);
         return;
     }
 
+    const float* written = nullptr;
+    size_t stride = 2;
     if (actualFramesToRead > 0) {
         // Based on the previous calculations, the only way that clientFrameSize will be larger than muFrameSize is
         // if the client specifies more than 2 channels. MuseScore doesn't support this (yet), so we use a workaround
@@ -617,11 +788,164 @@ void WasapiAudioDriver::th_processAudioData()
                 std::memcpy(frameStartPos, m_surroundAudioBuffer.data() + i * muFrameSize, muFrameSize);
                 std::memset(frameStartPos + muFrameSize, 0, clientFrameSize - muFrameSize);
             }
+            written = reinterpret_cast<const float*>(m_surroundAudioBuffer.data());
         } else {
             m_activeSpec.callback(data, actualFramesToRead * clientFrameSize);
+            written = reinterpret_cast<const float*>(data);
         }
     }
-    m_data->renderClient->ReleaseBuffer(actualFramesToRead, 0);
+
+    // The loudest sample (MuseScore writes stereo floats)
+    float peak = 0.0f;
+    if (written && d.mixFormat->wBitsPerSample == 32) {
+        for (uint32_t i = 0; i < actualFramesToRead; ++i) {
+            peak = std::max({ peak, std::abs(written[i * stride]), std::abs(written[i * stride + 1]) });
+        }
+    }
+
+    d.renderClient->ReleaseBuffer(actualFramesToRead, 0);
+    d.framesWritten += actualFramesToRead;
+
+    const double end = th_now();
+
+    // Startup isn't counted: the first callbacks come irregularly, before anything sounds
+    if (++d.callbacksSinceStart <= 20 || d.periodS <= 0.0) {
+        d.lastWriteEvent = event;
+        d.queuedAfterLastWrite = static_cast<double>(paddingFrames) + actualFramesToRead;
+        return;
+    }
+
+    // The frames were needed by the pass after those that what was queued at the event still
+    // covered (whole periods: a pass takes one). What was queued then: what the last write left,
+    // less a period for each pass since its event (not the padding now: once late, the queue may
+    // have run dry, and the padding doesn't tell by how much)
+    const double passesSinceLastWrite = d.lastWriteEvent > 0.0
+                                        ? std::max(1.0, std::round((event - d.lastWriteEvent) / d.periodS)) : 1.0;
+    const double queuedAtEvent = std::max(0.0, d.queuedAfterLastWrite - passesSinceLastWrite * d.periodFrames);
+    const double deadline = event + (1.0 + std::floor(queuedAtEvent / d.periodFrames)) * d.periodS;
+    const double headroomMs = (deadline - end) * 1000.0;
+    d.lastWriteEvent = event;
+    d.queuedAfterLastWrite = static_cast<double>(paddingFrames) + actualFramesToRead;
+
+    Data::Gathered& g = d.gathering;
+    ++g.callbacks;
+    g.clockStalls += clockStalls;
+    g.headroomSumMs += headroomMs;
+    g.headroomMinMs = std::min(g.headroomMinMs, headroomMs);
+    if (headroomMs < 0.0) {
+        ++g.underruns;
+        LOGW() << "underrun: written " << -headroomMs << " ms after the device needed it (woken "
+               << latenessS * 1000.0 << " ms after the event, " << paddingFrames << " frames queued)";
+    }
+    const double load = (end - start) / d.periodS * 100.0;
+    g.loadSum += load;
+    g.loadMax = std::max(g.loadMax, load);
+    if (latencyMs > 0.0) {
+        g.latencySumMs += latencyMs;
+        ++g.latencyCount;
+    }
+    g.peak = std::max(g.peak, peak);
+
+    if (d.windowMutex.try_lock()) {
+        d.gathered.add(g);
+        if (g.latencyCount > 0) {
+            d.lastLatencyMs = g.latencySumMs / g.latencyCount;
+        }
+        d.windowMutex.unlock();
+        g = {};
+    }
+}
+
+double WasapiAudioDriver::th_measureClock(double now, uint32_t& clockStalls)
+{
+    Data& d = *m_data;
+    if (!d.audioClock || d.clockFrequency == 0) {
+        return 0.0;
+    }
+
+    UINT64 position = 0;
+    UINT64 positionTime = 0; // 100 ns units, on the performance counter's clock
+    if (FAILED(d.audioClock->GetPosition(&position, &positionTime))) {
+        return 0.0;
+    }
+
+    // The frame playing now
+    const double playing = static_cast<double>(position) / d.clockFrequency * d.rate + (now - positionTime * 1e-7) * d.rate;
+
+    // Silence played in place of the stream: the position stops while time goes on
+    if (d.lastPlaying >= 0.0 && d.callbacksSinceStart > 20) {
+        const double behindFrames = (now - d.lastPlayingTime) * d.rate - (playing - d.lastPlaying);
+        if (behindFrames > d.periodFrames / 2.0) {
+            ++clockStalls;
+            LOGW() << "the device's position stalled for " << behindFrames / d.rate * 1000.0 << " ms";
+        }
+    }
+    d.lastPlaying = playing;
+    d.lastPlayingTime = now;
+
+    // From now to the first frame of the block about to be written being played
+    return (static_cast<double>(d.framesWritten) - playing) / d.rate * 1000.0;
+}
+
+IAudioOutputMonitor::Window WasapiAudioDriver::takeWindow()
+{
+    Data::Gathered g;
+    double latencyMs = 0.0;
+    {
+        std::scoped_lock lock { m_data->windowMutex };
+        g = m_data->gathered;
+        m_data->gathered = {};
+        latencyMs = m_data->lastLatencyMs;
+    }
+
+    Window w;
+    w.callbacks = g.callbacks;
+    w.underruns = g.underruns;
+    w.clockStalls = g.clockStalls;
+    if (g.callbacks > 0) {
+        w.headroomMeanMs = g.headroomSumMs / g.callbacks;
+        w.headroomMinMs = g.headroomMinMs;
+        w.loadMeanPercent = g.loadSum / g.callbacks;
+        w.loadMaxPercent = g.loadMax;
+    }
+    w.outputLatencyMs = latencyMs;
+    w.outputPeak = g.peak;
+    return w;
+}
+
+double WasapiAudioDriver::periodMs() const
+{
+    return m_opened ? m_data->periodMs.load() : 0.0;
+}
+
+std::vector<double> WasapiAudioDriver::marginLevelsMs() const
+{
+    std::vector<double> levels;
+    if (!m_opened) {
+        return levels;
+    }
+    std::scoped_lock lock { m_data->levelsMutex };
+    for (const uint32_t frames : m_data->levelFrames) {
+        levels.push_back(frames * 1000.0 / m_activeSpec.output.sampleRate);
+    }
+    return levels;
+}
+
+size_t WasapiAudioDriver::marginLevel() const
+{
+    std::scoped_lock lock { m_data->levelsMutex };
+    const size_t count = m_data->levelFrames.size();
+    return count ? std::min(m_data->requestedLevel.load(), count - 1) : 0;
+}
+
+void WasapiAudioDriver::setMarginLevel(size_t level)
+{
+    m_data->requestedLevel = level;
+}
+
+void WasapiAudioDriver::delayNextCallback(double ms)
+{
+    m_data->delayMs = ms;
 }
 
 void WasapiAudioDriver::close()
