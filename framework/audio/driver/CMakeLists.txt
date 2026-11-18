@@ -30,6 +30,7 @@ if (OS_IS_WIN)
 
     target_link_libraries(muse_audio_driver PRIVATE
         winmm
+        avrt
         mmdevapi
         mfplat
         WindowsApp # needed for C++/WinRT

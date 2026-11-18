@@ -23,6 +23,7 @@
 
 #include <combaseapi.h>
 #include <audioclient.h>
+#include <avrt.h>
 #include <mmdeviceapi.h>
 #include <functiondiscoverykeys_devpkey.h>
 
@@ -430,6 +431,14 @@ void WasapiAudioDriver::th_audioThread()
         return;
     }
 
+    //! NOTE Pro Audio MMCSS class: the audio thread is scheduled ahead of the others,
+    //! as Windows' own audio engine is; without it, a busy system makes it late (underruns)
+    DWORD mmcssTaskIndex = 0;
+    HANDLE mmcssTask = AvSetMmThreadCharacteristicsW(L"Pro Audio", &mmcssTaskIndex);
+    if (!mmcssTask) {
+        LOGW() << "failed AvSetMmThreadCharacteristics, error: " << GetLastError();
+    }
+
     m_opened = th_audioInitialize();
     m_activeSpecChanged.send(m_activeSpec);
 
@@ -445,6 +454,10 @@ void WasapiAudioDriver::th_audioThread()
         }
     }
 
+    if (mmcssTask) {
+        AvRevertMmThreadCharacteristics(mmcssTask);
+    }
+
     CoUninitialize();
 }
 
@@ -452,17 +465,59 @@ bool WasapiAudioDriver::th_audioInitialize()
 {
     TRACEFUNC;
 
-    REFERENCE_TIME bufferDuration = to_reftime(m_activeSpec.output.samplesPerChannel,
-                                               m_activeSpec.output.sampleRate);
+    const UINT32 blockFrames = static_cast<UINT32>(m_activeSpec.output.samplesPerChannel);
 
-    HRESULT hr = m_data->audioClient->Initialize(
-        AUDCLNT_SHAREMODE_SHARED,
-        AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-        bufferDuration,
-        0,
-        m_data->mixFormat,
-        nullptr
-        );
+    //! NOTE The device is called back once per period of Windows' audio engine (10 ms by default):
+    //! the engine's block is rendered on the callbacks that bring enough frames for it. Where the
+    //! engine's block is shorter than that, ask for a shorter period (low-latency shared mode,
+    //! IAudioClient3), the shortest that still holds the block: it is then rendered on every callback
+    HRESULT hr = E_NOTIMPL;
+    IAudioClient3* audioClient3 = nullptr;
+    if (SUCCEEDED(m_data->audioClient->QueryInterface(__uuidof(IAudioClient3), (void**)&audioClient3))) {
+        UINT32 defaultPeriod = 0;
+        UINT32 fundamentalPeriod = 0;
+        UINT32 minPeriod = 0;
+        UINT32 maxPeriod = 0;
+        HRESULT periodHr = audioClient3->GetSharedModeEnginePeriod(m_data->mixFormat, &defaultPeriod, &fundamentalPeriod,
+                                                                    &minPeriod, &maxPeriod);
+        if (SUCCEEDED(periodHr)) {
+            LOGI() << "shared mode engine periods (frames): default " << defaultPeriod << ", fundamental " << fundamentalPeriod
+                   << ", min " << minPeriod << ", max " << maxPeriod;
+        } else {
+            LOGW() << "failed GetSharedModeEnginePeriod, error: " << hrToString(periodHr);
+        }
+
+        if (SUCCEEDED(periodHr) && fundamentalPeriod > 0 && blockFrames < defaultPeriod && minPeriod < defaultPeriod) {
+            UINT32 period = minPeriod;
+            if (blockFrames > minPeriod) {
+                period += (blockFrames - minPeriod + fundamentalPeriod - 1) / fundamentalPeriod * fundamentalPeriod;
+            }
+            period = std::min(period, maxPeriod);
+
+            hr = audioClient3->InitializeSharedAudioStream(AUDCLNT_STREAMFLAGS_EVENTCALLBACK, period, m_data->mixFormat, nullptr);
+            if (SUCCEEDED(hr)) {
+                LOGI() << "low-latency shared mode, period: " << period << " frames";
+            } else {
+                //! NOTE e.g. AUDCLNT_E_ENGINE_PERIODICITY_LOCKED: another stream holds another period
+                LOGW() << "failed InitializeSharedAudioStream at " << period << " frames, error: " << hrToString(hr);
+            }
+        }
+        audioClient3->Release();
+    }
+
+    if (FAILED(hr)) {
+        REFERENCE_TIME bufferDuration = to_reftime(m_activeSpec.output.samplesPerChannel,
+                                                   m_activeSpec.output.sampleRate);
+
+        hr = m_data->audioClient->Initialize(
+            AUDCLNT_SHAREMODE_SHARED,
+            AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+            bufferDuration,
+            0,
+            m_data->mixFormat,
+            nullptr
+            );
+    }
 
     if (FAILED(hr)) {
         LOGE() << "failed audioClient->Initialize, error: " << hrToString(hr);
@@ -475,6 +530,9 @@ bool WasapiAudioDriver::th_audioInitialize()
     m_data->audioClient->GetDevicePeriod(&defaultPeriod, &minimumPeriod);
     m_defaultPeriod = to_samples(defaultPeriod, m_activeSpec.output.sampleRate);
     m_minimumPeriod = to_samples(minimumPeriod, m_activeSpec.output.sampleRate);
+
+    LOGI() << "initialized, block: " << blockFrames << ", buffer: " << m_bufferFrames << ", device period: default "
+           << m_defaultPeriod << ", minimum " << m_minimumPeriod << " (frames)";
 
     hr = m_data->audioClient->GetService(
         __uuidof(IAudioRenderClient),
